@@ -38,6 +38,12 @@ npm start          # 启动 http://localhost:3320
 | 已存在文件原地写 | tmp+rename 会换 inode,击穿房间身份 |
 | 空闲 30 分钟回收房间 | 控制内存;回收前兜底落盘 |
 | 无"自动恢复副本" | 会凭空产生文件让用户困惑;宁可在重载时丢弃静默窗口内的少量输入 |
+| 前端依赖全部本地打包 | 曾用 CDN 加载 hljs,离线/被墙时静默失败,只读页代码块一片灰 |
+| 高亮配色抽成共享 CSS | 编辑预览与只读视图同一套色板,改一处两边同步 |
+| 目录结构走 SSE 推送 | 别人的新建/重命名/移动/删除,所有在线页面 ≤1s 内同步,无需手动刷新 |
+| fs.watch 兜底广播 | 外部编辑器 / git pull / Agent 直接写文件也通知;用"结构指纹"去重,内容落盘不触发 |
+| 移动目标只能是文件夹 | 「移动」用文件夹选择器(不是手输路径),服务端再校验一次;目标为文件/不存在一律拒绝 |
+| 重命名与移动分离 | 移动 = `into:true` + 目录;改名 = 完整路径语义,两者走同一接口但校验不同 |
 
 ## API
 
@@ -48,23 +54,27 @@ npm start          # 启动 http://localhost:3320
 | GET | `/api/resolve?path=` | 路径现状 ok/moved/gone |
 | POST | `/api/files` | 新建文件(body: `{name}`) |
 | POST | `/api/mkdir` | 新建目录(`{path}`) |
-| POST | `/api/move` | 移动/改名(`{from,to}`) |
+| POST | `/api/move` | 移动(`{from,to,into:true}`,`to` 必须是已存在的文件夹,`''`=根)/ 改名(`{from,to}` 完整路径) |
 | POST | `/api/delete` | 删除(`{path}`,目录递归) |
 | POST | `/api/flush` | 立即落盘 |
 | POST | `/api/revision` | 存版本(`{message}` → git commit) |
 | GET | `/api/log?file=` | 文件历史(`git log --follow`) |
 | POST | `/api/restore` | 回滚(`{file,commit}`,支持跨改名) |
 | GET | `/api/epoch` | 服务世代号 |
+| GET | `/api/events` | SSE 推送:目录结构变更(`create/mkdir/move/move-batch/delete/commit/fs`) |
 | WS | `/ws/<路径>?epoch=` | Yjs 同步(`codemirror` 文本字段) |
 
 ## 目录结构
 
 ```
-server.mjs          HTTP + WS + 房间/落盘/git/回收(407 行)
-src/client.js       编辑器 + 协作 + UI(724 行)
-public/             静态页面与构建产物(app.js 为构建生成)
-scripts/build.mjs   构建 + 版本号自动化
+server.mjs          HTTP + WS + 房间/落盘/git/回收 + 只读视图(520 行)
+src/client.js       编辑器 + 协作 + UI(938 行)
+src/vendor.js       只读视图依赖打包入口(marked/DOMPurify/hljs,本地构建不依赖 CDN)
+public/index.html   编辑页;public/view.html 只读页
+public/code-theme.css  代码高亮配色(编辑预览与只读视图共用,保证两边一致)
+scripts/build.mjs   构建两个入口 + 自动更新各页面资源版本号
 notes/              数据目录(自身是一个 git 仓库)
+read-view/          只读视图的游离 worktree(HEAD 快照,与 notes/ 物理隔离)
 demo/               Agent 协作演示与压测脚本
 ```
 

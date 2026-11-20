@@ -235,6 +235,42 @@ function historicalPath(commit, file, depth = 5) {
   return null
 }
 
+// ---------- SSE:目录结构变更广播 ----------
+const sseClients = new Set()
+function broadcastTree(reason) {
+  const msg = `data: ${JSON.stringify({ type: 'tree', reason })}\n\n`
+  for (const res of sseClients) { try { res.write(msg) } catch { sseClients.delete(res) } }
+}
+// 心跳:防止中间层把闲置的长连接掐掉
+setInterval(() => { for (const res of sseClients) { try { res.write(': ping\n\n') } catch { sseClients.delete(res) } } }, 25 * 1000)
+
+// 结构指纹:只有"文件/目录集合"真变了才广播(内容落盘不会触发多余刷新)
+let lastTreeSig = null
+const treeSignature = () => {
+  const w = walkNotes()
+  return w.files.slice().sort().join('\n') + '|' + w.dirs.slice().sort().join('\n')
+}
+function noteTreeChanged(reason) {
+  const sig = treeSignature()
+  if (sig === lastTreeSig) return
+  lastTreeSig = sig
+  broadcastTree(reason)
+}
+lastTreeSig = treeSignature()
+
+// 磁盘监听兜底:外部编辑器 / git pull / Agent 脚本直接写文件,同样及时通知
+let watchTimer = null
+try {
+  fs.watch(NOTES, { recursive: true }, (_ev, filename) => {
+    const first = String(filename || '').split(path.sep)[0]
+    if (first === '.git') return   // git 内部文件不关心
+    clearTimeout(watchTimer)
+    watchTimer = setTimeout(() => {
+      try { noteTreeChanged('fs') } catch (e) { console.log('[watch] ' + e.message) }
+    }, 500)
+  })
+} catch (e) { console.log('[watch] 目录监听不可用: ' + e.message) }
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://x')
   const [status, headers, body] = await (async () => {
@@ -242,6 +278,18 @@ const server = http.createServer(async (req, res) => {
       if (url.pathname === '/api/files' && req.method === 'GET') {
         const w = walkNotes()
         return json({ ok: true, files: w.files.sort(), dirs: w.dirs.sort() })
+      }
+      if (url.pathname === '/api/events' && req.method === 'GET') {
+        // SSE:目录结构变更广播(别人的新建/移动/删除,自己这边也能立刻看到)
+        res.writeHead(200, {
+          'Content-Type': 'text/event-stream; charset=utf-8',
+          'Cache-Control': 'no-cache',
+          Connection: 'keep-alive',
+        })
+        res.write(': connected\n\n')
+        sseClients.add(res)
+        req.on('close', () => sseClients.delete(res))
+        return [null] // 长连接:已自行接管响应,跳过下面的 writeHead/end
       }
       if (url.pathname === '/api/resolve' && req.method === 'GET') {
         const file = safePath(url.searchParams.get('path') || '')
@@ -277,6 +325,7 @@ const server = http.createServer(async (req, res) => {
         if (!name) return json({ ok: false, error: '非法名称' }, 400)
         if (fs.existsSync(notePath(name))) return json({ ok: false, error: '已存在' }, 409)
         atomicWrite(notePath(name), `# ${name.replace(/\.[^.]+$/, '').split('/').pop()}\n\n`)
+        noteTreeChanged('create')
         return json({ ok: true, name })
       }
       if (url.pathname === '/api/mkdir' && req.method === 'POST') {
@@ -285,6 +334,7 @@ const server = http.createServer(async (req, res) => {
         if (!dir) return json({ ok: false, error: '非法路径' }, 400)
         fs.mkdirSync(path.join(NOTES, dir), { recursive: true })
         if (!fs.existsSync(path.join(NOTES, dir, '.gitkeep'))) fs.writeFileSync(path.join(NOTES, dir, '.gitkeep'), '')
+        noteTreeChanged('mkdir')
         return json({ ok: true, path: dir })
       }
       if (url.pathname === '/api/move' && req.method === 'POST') {
@@ -292,6 +342,7 @@ const server = http.createServer(async (req, res) => {
         const rawFrom = String(b.from || '').trim()
         const to = String(b.to || '').trim()
         if (!rawFrom) return json({ ok: false, error: '缺少源路径' }, 400)
+        if (rawFrom === '/' || rawFrom === '.') return json({ ok: false, error: '根目录不能被移动' }, 400)
         // 目录探测必须在 safePath 之前:safePath 会给无后缀名强加 .md,目录名会被改写
         const fromDir = safeDirPath(rawFrom)
         const dirSrc = fromDir ? notePath(fromDir) : null
@@ -300,8 +351,20 @@ const server = http.createServer(async (req, res) => {
         if (!from) return json({ ok: false, error: '非法源路径' }, 400)
         const src = notePath(from)
         if (!fs.existsSync(src)) return json({ ok: false, error: '源不存在' }, 404)
-        // 目标路径统一走 safePath/safeDirPath(支持点目录,拒绝 . .. .git;不再静默剥离)
-        const toRel = isDir ? safeDirPath(to) : safePath(to)
+        let toRel
+        if (b.into === true) {
+          // 「移动到文件夹」语义:目标必须是已存在的目录('' 或 '/' = 根目录),文件名保持不变
+          const toDir = (to === '' || to === '/') ? '' : safeDirPath(to)
+          if (to !== '' && to !== '/' && !toDir) return json({ ok: false, error: '非法目标路径' }, 400)
+          const absTo = toDir ? notePath(toDir) : NOTES
+          if (!fs.existsSync(absTo) || !fs.statSync(absTo).isDirectory()) return json({ ok: false, error: '目标不是文件夹' }, 400)
+          if (isDir && (toDir === from || (toDir && toDir.startsWith(from + '/')))) return json({ ok: false, error: '不能移入自身或子目录' }, 400)
+          toRel = toDir ? toDir + '/' + from.split('/').pop() : from.split('/').pop()
+        } else {
+          // 完整路径语义(重命名等):目标就是最终路径,保持原行为
+          toRel = isDir ? safeDirPath(to) : safePath(to)
+          if (isDir && (toRel === from || toRel.startsWith(from + '/'))) return json({ ok: false, error: '不能移入自身或子目录' }, 400)
+        }
         if (!toRel) return json({ ok: false, error: '非法目标路径' }, 400)
         const dst = notePath(toRel)
         if (dst !== src && fs.existsSync(dst)) return json({ ok: false, error: '目标已存在' }, 409)
@@ -323,7 +386,53 @@ const server = http.createServer(async (req, res) => {
         }
         redirects.set(from, toRel)
         console.log(`[move] ${from} -> ${toRel}`)
+        noteTreeChanged('move')
         return json({ ok: true, from, to: toRel })
+      }
+      if (url.pathname === '/api/move-batch' && req.method === 'POST') {
+        // 批量移动:{ items: [{from, isDir}], to: '目标目录' (''=根) }
+        const b = await readBody(req)
+        const items = Array.isArray(b.items) ? b.items : []
+        const destDir = b.to === '' || b.to === '/' ? '' : safeDirPath(b.to)
+        if (!items.length || destDir === null) return json({ ok: false, error: '参数错误' }, 400)
+        // 目标只能是已存在的文件夹(根目录除外):不允许落到文件上或凭空造目录
+        if (destDir) {
+          const absDest = notePath(destDir)
+          if (!fs.existsSync(absDest) || !fs.statSync(absDest).isDirectory()) return json({ ok: false, error: '目标不是文件夹' }, 400)
+        }
+        const results = []
+        for (const it of items) {
+          const rawFrom = String(it.from || '').trim()
+          const fromDir = safeDirPath(rawFrom)
+          const dirSrc = fromDir ? notePath(fromDir) : null
+          const isDir = !!(it.isDir && dirSrc && fs.existsSync(dirSrc) && fs.statSync(dirSrc).isDirectory())
+          const from = isDir ? fromDir : safePath(rawFrom)
+          if (!from) { results.push({ from: rawFrom, ok: false, error: '非法路径' }); continue }
+          const src = notePath(from)
+          if (!fs.existsSync(src)) { results.push({ from, ok: false, error: '不存在' }); continue }
+          // 目标:目录名拼 basename;文件名保持原名
+          const base = from.split('/').pop()
+          const toRel = destDir ? destDir + '/' + base : base
+          const dst = notePath(toRel)
+          // 禁止移入自身或自己的子目录
+          if (isDir && (toRel === from || toRel.startsWith(from + '/'))) { results.push({ from, ok: false, error: '不能移入自身' }); continue }
+          if (dst !== src && fs.existsSync(dst)) { results.push({ from, ok: false, error: '目标已存在:' + toRel }); continue }
+          let inodeKey = null
+          if (!isDir) { try { inodeKey = inodeKeyOf(src) } catch {} }
+          fs.mkdirSync(path.dirname(dst), { recursive: true })
+          try { fs.renameSync(src, dst) } catch (e) { results.push({ from, ok: false, error: e.message }); continue }
+          if (isDir) {
+            for (const [k, p] of [...registry]) {
+              if (p === from || p.startsWith(from + '/')) { registry.set(k, toRel + p.slice(from.length)); redirects.set(p, toRel + p.slice(from.length)) }
+            }
+          } else if (inodeKey) { registry.set(inodeKey, toRel) }
+          redirects.set(from, toRel)
+          console.log(`[move] ${from} -> ${toRel}`)
+          results.push({ from, ok: true, to: toRel })
+        }
+        const okCount = results.filter(r => r.ok).length
+        if (okCount) noteTreeChanged('move-batch')
+        return json({ ok: okCount > 0, moved: okCount, total: items.length, results })
       }
       if (url.pathname === '/api/delete' && req.method === 'POST') {
         const b = await readBody(req)
@@ -344,6 +453,7 @@ const server = http.createServer(async (req, res) => {
             registry.delete(k)
           }
         }
+        noteTreeChanged('delete')
         return json({ ok: true, deleted: rel })
       }
       if (url.pathname === '/api/epoch' && req.method === 'GET') {
@@ -362,6 +472,9 @@ const server = http.createServer(async (req, res) => {
         gitRun('add', '-A')
         const r = gitRun('commit', '-m', msg)
         if (r.status !== 0) return json({ ok: false, error: '没有变更可提交' })
+        // 提交后立刻把只读视图的 worktree 跳到新 HEAD,并通知所有页面刷新
+        refreshReadView('commit')
+        noteTreeChanged('commit')
         return json({ ok: true, commit: gitOut('rev-parse', '--short', 'HEAD'), message: msg, flushed })
       }
       if (url.pathname === '/api/log' && req.method === 'GET') {
@@ -401,7 +514,10 @@ const server = http.createServer(async (req, res) => {
         return [200, { 'Content-Type': 'text/html; charset=utf-8' }, fs.readFileSync(f)]
       }
       if (url.pathname === '/view-api/status' && req.method === 'GET') {
-        return json({ ok: true, ...viewStatus })
+        // pending:工作区里尚未提交的改动数。只读视图只看 HEAD,不提示会让用户以为"目录/文件丢了"
+        const out = gitRun('status', '--porcelain').stdout || ''
+        const pending = out.split('\n').filter(l => l.trim()).length
+        return json({ ok: true, ...viewStatus, pending })
       }
       if (url.pathname === '/view-api/refresh' && req.method === 'POST') {
         const st = refreshReadView('manual')
@@ -431,6 +547,11 @@ const server = http.createServer(async (req, res) => {
         }
         return [200, { 'Content-Type': 'text/plain; charset=utf-8' }, fs.readFileSync(abs, 'utf8')]
       }
+      // /view/<路径>:只读视图(SPA 路由,由前端识别 /view/ 前缀进入只读模式)
+      if (url.pathname.startsWith('/view/')) {
+        const f = path.join(__dirname, 'public', 'index.html')
+        if (fs.existsSync(f)) return [200, { 'Content-Type': MIME['.html'] }, fs.readFileSync(f)]
+      }
       // 静态文件
       const rel = url.pathname === '/' ? '/index.html' : url.pathname
       const f = path.join(__dirname, 'public', rel)
@@ -442,6 +563,7 @@ const server = http.createServer(async (req, res) => {
       return [500, { 'Content-Type': 'application/json' }, JSON.stringify({ ok: false, error: e.message })]
     }
   })()
+  if (status === null) return   // SSE 长连接已自行接管响应
   res.writeHead(status, headers)
   res.end(body)
 })

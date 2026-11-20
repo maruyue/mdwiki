@@ -3,6 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <title>mdwiki-demo</title>
+<link rel="stylesheet" href="/code-theme.css?v=1795162051983">
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -40,7 +41,7 @@
   #sidebar a.active { background: var(--active); color: var(--fg-strong); border-left-color: var(--accent); }
   #sidebar .dir { color: var(--fg-dim); font-size: 12px; padding: 5px 10px; cursor: pointer; user-select: none; }
   #sidebar .dir:hover { color: var(--fg); background: var(--bg3); }
-  .tree-row { display: flex; align-items: center; position: relative; }
+  .tree-row { display: flex; align-items: center; position: relative; user-select: none; -webkit-user-select: none; }
   .tree-row a { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: flex; align-items: center; gap: 5px; }
   .tree-row a svg { width: 12px; height: 12px; flex-shrink: 0; color: var(--fg-dim); }
   .tree-label { display: inline-flex; align-items: center; gap: 4px; }
@@ -55,6 +56,9 @@
   .row-move svg { width: 11px; height: 11px; display: block; }
   .tree-row:hover .row-menu-btn { display: block; }
   .row-menu-btn:hover { color: var(--link); }
+  .tree-row.selected { background: var(--active); outline: 1px solid var(--accent); outline-offset: -1px; }
+  .tree-row.dragging { opacity: .4; }
+  .tree-row.drop-target, #file-list.drop-target { background: rgba(77, 170, 252, .18) !important; outline: 1.5px dashed var(--link); outline-offset: -2px; }
   #editor, #preview { flex: 1; overflow: auto; }
   #editor-col { flex: 1; display: flex; flex-direction: column; min-width: 0; }
   #toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 1px; padding: 4px 8px; background: var(--bg2); border-bottom: 1px solid var(--border); }
@@ -74,7 +78,9 @@
   #editor-col.locked #toolbar { opacity: .55; }
   #editor .cm-editor { height: 100%; }
   #editor .cm-editor .cm-scroller { overflow: auto; }
-  #preview { padding: 30px 40px; border-left: 1px solid var(--border); font-size: 15px; line-height: 1.75; color: var(--fg); max-width: 52rem; overflow-y: auto; }
+  #splitter { width: 5px; flex-shrink: 0; cursor: col-resize; background: var(--border); transition: background .15s; }
+  #splitter:hover, #splitter.active { background: var(--link); }
+  #preview { padding: 30px 40px; font-size: 15px; line-height: 1.75; color: var(--fg); max-width: 52rem; overflow-y: auto; }
   #preview > *:first-child { margin-top: 0; }
   #preview h1 { font-size: 1.75em; color: var(--fg-strong); margin: 1em 0 0.5em; padding-bottom: 0.3em; border-bottom: 1px solid var(--border2); }
   #preview h2 { font-size: 1.4em; color: var(--fg-strong); margin: 1em 0 0.5em; padding-bottom: 0.25em; border-bottom: 1px solid var(--border2); }
@@ -100,23 +106,7 @@
   ::-webkit-scrollbar-thumb { background: var(--scroll); border-radius: 5px; border: 2px solid transparent; background-clip: content-box; }
   ::-webkit-scrollbar-thumb:hover { background: var(--scroll-hover); background-clip: content-box; border: 2px solid transparent; }
   ::-webkit-scrollbar-track { background: transparent; }
-  /* highlight.js 预览代码高亮(GitHub Dark / Light 双色板) */
-  .hljs-comment, .hljs-quote { color: #8b949e; font-style: italic; }
-  .hljs-keyword, .hljs-selector-tag, .hljs-deletion { color: #ff7b72; }
-  .hljs-string, .hljs-doctag, .hljs-regexp, .hljs-addition { color: #a5d6ff; }
-  .hljs-number, .hljs-literal, .hljs-attr, .hljs-attribute { color: #79c0ff; }
-  .hljs-title, .hljs-title.function_, .hljs-section, .hljs-name { color: #d2a8ff; }
-  .hljs-type, .hljs-class .hljs-title, .hljs-title.class_, .hljs-built_in { color: #ffa657; }
-  .hljs-meta, .hljs-symbol, .hljs-bullet, .hljs-link { color: #79c0ff; }
-  .hljs-emphasis { font-style: italic; }
-  .hljs-strong { font-weight: 700; }
-  body.light .hljs-comment, body.light .hljs-quote { color: #6e7781; }
-  body.light .hljs-keyword, body.light .hljs-selector-tag, body.light .hljs-deletion { color: #cf222e; }
-  body.light .hljs-string, body.light .hljs-doctag, body.light .hljs-regexp, body.light .hljs-addition { color: #0a3069; }
-  body.light .hljs-number, body.light .hljs-literal, body.light .hljs-attr, body.light .hljs-attribute { color: #0550ae; }
-  body.light .hljs-title, body.light .hljs-title.function_, body.light .hljs-section, body.light .hljs-name { color: #8250df; }
-  body.light .hljs-type, body.light .hljs-class .hljs-title, body.light .hljs-title.class_, body.light .hljs-built_in { color: #953800; }
-  body.light .hljs-meta, body.light .hljs-symbol, body.light .hljs-bullet, body.light .hljs-link { color: #0550ae; }
+  /* 代码高亮配色统一在 code-theme.css(编辑页预览与只读视图共用同一套色板) */
   #note-menu { position: fixed; z-index: 1000; width: 240px; background: var(--bg2); border: 1px solid var(--border2); border-radius: 8px; box-shadow: 0 8px 24px rgba(0,0,0,0.35); padding: 6px; }
   #note-menu input { width: 100%; padding: 5px 8px; border: 1px solid var(--border2); border-radius: 5px; background: var(--bg); color: var(--fg); font-size: 13px; outline: none; margin-bottom: 4px; }
   #note-menu .note-menu-list { max-height: 260px; overflow-y: auto; }
@@ -128,6 +118,11 @@
   #note-menu .menu-danger:hover { background: #5a1d1d; color: #ff8f80; }
   #editor .cm-foldGutter { display: none !important; } /* 去掉折叠小箭头列(CM 运行时样式序在后,必须 important) */
   .cm-ySelectionInfo { opacity: 1 !important; } /* 协作者名字标签常显 */
+  /* 轻提示:替代 alert 的非阻塞反馈(拖拽失败不再弹模态框) */
+  #toast { position: fixed; left: 50%; bottom: 28px; transform: translate(-50%, 12px); z-index: 2000; padding: 8px 16px; border-radius: 8px; font-size: 13px; color: #fff; background: #2f7d4f; box-shadow: 0 8px 24px rgba(0,0,0,.4); opacity: 0; pointer-events: none; transition: opacity .18s, transform .18s; max-width: 70vw; }
+  #toast.show { opacity: 1; transform: translate(-50%, 0); }
+  #toast.err { background: #a3352b; }
+  #toast.info { background: #3a3a3a; }
 </style>
 </head>
 <body class="dark">
@@ -148,6 +143,7 @@
     <div id="toolbar"></div>
     <div id="editor"></div>
   </div>
+  <div id="splitter" title="拖拽调整宽度,双击恢复"></div>
   <div id="preview" class="markdown-body"></div>
 </main>
 <script>
@@ -159,6 +155,6 @@ window.addEventListener('error', function (e) {
   document.body && document.body.appendChild(d)
 })
 </script>
-<script src="/app.js?v=1795135735404"></script>
+<script src="/app.js?v=1795162051983"></script>
 </body>
 </html>

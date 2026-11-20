@@ -1,0 +1,18 @@
+/* highlight.js 代码高亮配色(GitHub Dark / Light 双色板)
+   编辑页预览与只读视图共用,保证两边颜色完全一致 */
+.hljs-comment, .hljs-quote { color: #8b949e; font-style: italic; }
+.hljs-keyword, .hljs-selector-tag, .hljs-deletion { color: #ff7b72; }
+.hljs-string, .hljs-doctag, .hljs-regexp, .hljs-addition { color: #a5d6ff; }
+.hljs-number, .hljs-literal, .hljs-attr, .hljs-attribute { color: #79c0ff; }
+.hljs-title, .hljs-title.function_, .hljs-section, .hljs-name { color: #d2a8ff; }
+.hljs-type, .hljs-class .hljs-title, .hljs-title.class_, .hljs-built_in { color: #ffa657; }
+.hljs-meta, .hljs-symbol, .hljs-bullet, .hljs-link { color: #79c0ff; }
+.hljs-emphasis { font-style: italic; }
+.hljs-strong { font-weight: 700; }
+body.light .hljs-comment, body.light .hljs-quote { color: #6e7781; }
+body.light .hljs-keyword, body.light .hljs-selector-tag, body.light .hljs-deletion { color: #cf222e; }
+body.light .hljs-string, body.light .hljs-doctag, body.light .hljs-regexp, body.light .hljs-addition { color: #0a3069; }
+body.light .hljs-number, body.light .hljs-literal, body.light .hljs-attr, body.light .hljs-attribute { color: #0550ae; }
+body.light .hljs-title, body.light .hljs-title.function_, body.light .hljs-section, body.light .hljs-name { color: #8250df; }
+body.light .hljs-type, body.light .hljs-class .hljs-title, body.light .hljs-title.class_, body.light .hljs-built_in { color: #953800; }
+body.light .hljs-meta, body.light .hljs-symbol, body.light .hljs-bullet, body.light .hljs-link { color: #0550ae; }

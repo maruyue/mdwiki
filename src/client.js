@@ -298,6 +298,7 @@ const TOOLBAR = [
 
 // ---------- 笔记链接菜单(工具栏 🔗:笔记内链 + 外部 URL) ----------
 let filesCache = []
+let dirsCache = []   // 目录列表(移动目标选择器用)
 function openLinkMenu(anchorBtn) {
   const menu = openMenu(anchorBtn, {
     left: r => Math.max(8, r.left - 130),
@@ -349,7 +350,14 @@ function openLinkMenu(anchorBtn) {
   input.focus()
   input.onkeydown = extInput.onkeydown = (e) => { if (e.key === 'Escape') closeNoteMenu() }
 }
-function closeNoteMenu() { document.getElementById('note-menu')?.remove() }
+// 关闭菜单时必须同时摘掉"点外部关闭"的 document 监听,否则监听器会永久累积:
+// 之后任何一次点击都会被旧菜单的监听器当成"点在外面",把新打开的菜单立刻关掉
+// (表现:从菜单里点「移动」→ 文件夹选择器一闪就没,2026-11-20 实测)
+let menuDocListener = null
+function closeNoteMenu() {
+  document.getElementById('note-menu')?.remove()
+  if (menuDocListener) { document.removeEventListener('click', menuDocListener, true); menuDocListener = null }
+}
 
 // ---------- 菜单工具:三处下拉菜单共用同一骨架(定位/外点关闭/条目) ----------
 function openMenu(anchor, { left, build }) {
@@ -361,10 +369,12 @@ function openMenu(anchor, { left, build }) {
   menu.style.left = left(rect) + 'px'
   menu.style.top = (rect.bottom + 6) + 'px'
   document.body.appendChild(menu)
+  // 捕获阶段判断,先于菜单项自己的 click:点条目时不会误关,点外部立即关闭
+  menuDocListener = (e) => {
+    if (!menu.contains(e.target) && e.target !== anchor) closeNoteMenu()
+  }
   setTimeout(() => {
-    document.addEventListener('click', function onDoc(e) {
-      if (!menu.contains(e.target) && e.target !== anchor) { closeNoteMenu(); document.removeEventListener('click', onDoc) }
-    })
+    if (document.getElementById('note-menu') === menu) document.addEventListener('click', menuDocListener, true)
   }, 0)
   return menu
 }
@@ -396,22 +406,118 @@ function handleEpochMismatch() {
 let view = null, provider = null, scrollAbort = null
 const currentFile = () => decodeURIComponent(location.hash.slice(1)) || '欢迎.md'
 
-// ---------- 文件列表(目录树) ----------
+// ---------- 文件列表(目录树) + 拖拽 ----------
 const closedDirs = new Set() // 默认全部展开,点过的收起
+const selection = new Set()  // 多选:完整路径集合
+let dragItems = []           // 本次拖拽的源(单选或框选)
+
+// 拖拽入口:写在 render 循环外,由各 row 触发
+function setupDrag(rowEl, path, isDir) {
+  rowEl.draggable = true
+  rowEl.addEventListener('dragstart', (e) => {
+    // 没有加入多选 → 拖的就是它自己
+    if (!selection.has(path)) { selection.clear(); selection.add(path); renderSelection() }
+    dragItems = [...selection].map(p => ({
+      from: p,
+      isDir: !filesCache.includes(p), // 不在文件列表 → 目录
+    }))
+    e.dataTransfer.setData('text/plain', JSON.stringify(dragItems))
+    e.dataTransfer.effectAllowed = 'move'
+    rowEl.classList.add('dragging')
+  })
+  rowEl.addEventListener('dragend', () => { rowEl.classList.remove('dragging'); clearDropHint() })
+}
+
+// 放置目标:目录行(移入)与根区域(移到根)
+// 注意:根区域是常驻元素,必须"只绑一次",否则每次 refreshFiles 都会叠加一层 drop 监听
+// → 一次拖放触发 N 次移动,后 N-1 次报「不存在」并弹窗(2026-11-20 实测事故)
+let rootZoneBound = false
+function setupDropZone(el, targetDir) {
+  if (el === $fileList) {
+    if (rootZoneBound) return
+    rootZoneBound = true
+  }
+  el.addEventListener('dragover', (e) => {
+    e.preventDefault()
+    e.stopPropagation() // 防止父容器也高亮
+    e.dataTransfer.dropEffect = 'move'
+    el.classList.add('drop-target')
+  })
+  el.addEventListener('dragleave', () => el.classList.remove('drop-target'))
+  el.addEventListener('drop', async (e) => {
+    e.preventDefault()
+    e.stopPropagation() // 目录行的 drop 不能冒泡到 file-list(否则双重移动:目录+根)
+    el.classList.remove('drop-target')
+    // 优先用模块级 dragItems(dragstart 时设置,保证多选完整);
+    // dataTransfer.getData 在某些浏览器/场景下可能返回空或不完整
+    let items = (dragItems && dragItems.length > 0) ? dragItems : []
+    if (!items.length) {
+      try { items = JSON.parse(e.dataTransfer.getData('text/plain')) || [] } catch {}
+    }
+    if (!items.length) return
+    const dest = targetDir === '' ? '' : targetDir
+    // 目标目录本身在拖拽集合中 → 无效
+    if (items.some(it => it.from === dest)) return
+    dragItems = []   // 先清,防止重复触发(事件冒泡/快速连点)时重复提交
+    const r = await (await fetch('/api/move-batch', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ items, to: dest }),
+    })).json()
+    if (!r.ok) toast(r.results?.find(x => !x.ok)?.error || '移动失败', 'err')
+    selection.clear()
+    refreshFiles()
+    // 当前打开的文件被移走 → 跳新路径
+    const cur = currentFile()
+    const moved = (r.results || []).find(x => x.ok && (x.from === cur || cur.startsWith(x.from + '/')))
+    if (moved) { location.hash = '#' + encodeURIComponent(moved.to + cur.slice(moved.from.length)); openFile() }
+  })
+}
+
+function clearDropHint() { document.querySelectorAll('.drop-target').forEach(el => el.classList.remove('drop-target')) }
+// 全局兜底:任何拖拽结束都清掉残留高亮(只注册一次)
+document.addEventListener('dragend', () => { document.querySelectorAll('.dragging').forEach(el => el.classList.remove('dragging')); clearDropHint() })
+
+// 轻提示:替代 alert(模态框会打断操作,且拖拽场景下会连环弹)
+let toastEl = null, toastTimer = null, lastToast = { msg: '', at: 0 }
+function toast(msg, kind = 'ok') {
+  const now = Date.now()
+  if (msg === lastToast.msg && now - lastToast.at < 800) return   // 相同消息去重
+  lastToast = { msg, at: now }
+  if (!toastEl) {
+    toastEl = document.createElement('div')
+    toastEl.id = 'toast'
+    document.body.appendChild(toastEl)
+  }
+  toastEl.textContent = msg
+  toastEl.className = 'show ' + kind
+  clearTimeout(toastTimer)
+  toastTimer = setTimeout(() => { toastEl.className = '' }, 2600)
+}
+function renderSelection() {
+  document.querySelectorAll('#sidebar .tree-row').forEach(row => {
+    row.classList.toggle('selected', selection.has(row.dataset.path))
+  })
+}
 async function refreshFiles() {
   const r = await (await fetch('/api/files')).json()
   filesCache = r.files || []
+  dirsCache = r.dirs || []
   const root = {}
-  for (const d of r.dirs || []) { // 空目录也要出现在树上:每一段都建节点
+  for (const d of r.dirs || []) { // 空目录也要出现在树上:每一段都建节点并记录完整路径
     let node = root
-    for (const p of d.split('/')) node = (node[p] ??= {})
+    let acc = ''
+    for (const p of d.split('/')) {
+      acc = acc ? acc + '/' + p : p
+      node = (node[p] ??= {})
+      node.__path = acc
+    }
   }
   for (const f of r.files) {
     const parts = f.replace(/\.md$/, '').split('/')
     let node = root
     parts.forEach((p, i) => {
       if (i === parts.length - 1) (node.__files ??= []).push({ name: p, full: f })
-      else { node = (node[p] ??= {}); node.__path = (node.__path ? node.__path + '/' : '') + p }
+      else { node = (node[p] ??= {}); node.__path ??= p }
     })
   }
   const render = (node, depth) => {
@@ -420,6 +526,7 @@ async function refreshFiles() {
       const open = !closedDirs.has(k)
       const d = document.createElement('div')
       d.className = 'dir tree-row'
+      d.dataset.path = child.__path || k
       d.style.paddingLeft = (10 + depth * 13) + 'px'
       const label = document.createElement('span')
       label.className = 'tree-label'
@@ -433,18 +540,36 @@ async function refreshFiles() {
       mv.innerHTML = svgIcon('ellipsis')
       mv.onclick = (e) => { e.stopPropagation(); openRowMenu(mv, child.__path || k, true) }
       d.appendChild(mv)
-      d.onclick = () => { closedDirs.has(k) ? closedDirs.delete(k) : closedDirs.add(k); refreshFiles() }
+      d.onclick = (e) => {
+        if (e.metaKey || e.ctrlKey || e.shiftKey) { // 多选(目录也可拖)
+          selection.has(d.dataset.path) ? selection.delete(d.dataset.path) : selection.add(d.dataset.path)
+          renderSelection(); return
+        }
+        closedDirs.has(k) ? closedDirs.delete(k) : closedDirs.add(k); refreshFiles()
+      }
+      setupDrag(d, d.dataset.path, true)
+      setupDropZone(d, d.dataset.path) // 目录行 = 放置目标(移入该目录)
       frag.appendChild(d)
       if (open) frag.appendChild(render(child, depth + 1))
     }
     for (const f of node.__files ?? []) {
       const row = document.createElement('div')
       row.className = 'tree-row'
+      row.dataset.path = f.full
       row.style.paddingLeft = (26 + depth * 13) + 'px'
       const a = document.createElement('a')
       a.href = '#' + encodeURIComponent(f.full)
       const extCls = 'f-' + (f.full.match(/\.([a-z0-9]+)$/i)?.[1] || 'md').toLowerCase()
       a.innerHTML = svgIcon('file-lines') + '<span class="' + extCls + '">' + f.name + '</span>'
+      a.onclick = (e) => {
+        if (e.metaKey || e.ctrlKey || e.shiftKey) { e.preventDefault(); return }
+        setTimeout(refreshFiles, 0)
+      }
+      row.onclick = (e) => {
+        if (e.metaKey || e.ctrlKey || e.shiftKey) { e.preventDefault(); selection.has(f.full) ? selection.delete(f.full) : selection.add(f.full); renderSelection() }
+      }
+      // 注:不在这里 preventDefault(mousedown 的 preventDefault 会阻止原生 HTML5 拖拽启动!)
+      // 文字选中干扰已用 CSS user-select:none 解决
       if (f.full === currentFile()) row.classList.add('active')
       a.onclick = () => setTimeout(refreshFiles, 0)
       const mv = document.createElement('button')
@@ -452,6 +577,10 @@ async function refreshFiles() {
       mv.title = '操作'
       mv.innerHTML = svgIcon('ellipsis')
       mv.onclick = (e) => { e.preventDefault(); e.stopPropagation(); openRowMenu(mv, f.full, false) }
+      setupDrag(row, f.full, false)
+      // 文件行不是放置目标:拦住冒泡,否则会被根区域当成"移到根"(且旧代码会连环弹「不存在」)
+      row.addEventListener('dragover', (e) => { e.preventDefault(); e.stopPropagation(); e.dataTransfer.dropEffect = 'none' })
+      row.addEventListener('drop', (e) => { e.preventDefault(); e.stopPropagation() })
       row.appendChild(a)
       row.appendChild(mv)
       frag.appendChild(row)
@@ -460,6 +589,8 @@ async function refreshFiles() {
   }
   $fileList.innerHTML = ''
   $fileList.appendChild(render(root, 0))
+  setupDropZone($fileList, '') // 列表空白区 = 移到根(内部只绑一次)
+  renderSelection()
 }
 
 // ---------- 打开文件:重建 Yjs 房间 ----------
@@ -473,7 +604,14 @@ async function openFile() {
   // 路径可能已被移动/删除:先解析,该跳转跳转
   const res = await resolvePath(file)
   if (res.status === 'moved') { location.hash = '#' + encodeURIComponent(res.to); return }
-  if (res.status === 'gone') { alert('文件不存在(可能被移动或删除):' + file); location.hash = '#' + encodeURIComponent('欢迎.md'); return }
+  if (res.status === 'gone') {
+    const fallback = filesCache.find(f => f.endsWith('.md')) || filesCache[0]
+    // 无 hash 的隐式默认文件缺失:静默换第一个文件;显式打开的文件没了才提示
+    if (!location.hash || !fallback) { if (fallback) location.hash = '#' + encodeURIComponent(fallback); return }
+    toast('文件不存在(可能被移动或删除):' + file, 'err')
+    location.hash = '#' + encodeURIComponent(fallback)
+    return
+  }
 
   $curFile.textContent = file
   applyFileUi(file)
@@ -523,7 +661,7 @@ async function createCollab(file) {
       if (!provider.wsconnected) {
         const r = await resolvePath(file)
         if (r.status === 'moved') location.hash = '#' + encodeURIComponent(r.to)
-        else if (r.status === 'gone') { alert('此文件已被删除:' + file); location.hash = '#' + encodeURIComponent('欢迎.md') }
+        else if (r.status === 'gone') { toast('此文件已被删除:' + file, 'err'); location.hash = '#' + encodeURIComponent('欢迎.md') }
       }
     }, 6000)
   })
@@ -629,7 +767,7 @@ $btnNew.onclick = () => {
           body: JSON.stringify({ name }),
         })).json()
         if (r.ok) { location.hash = '#' + encodeURIComponent(r.name); refreshFiles(); openFile() }
-        else alert(r.error)
+        else toast(r.error, 'err')
       } })
       menuItem(menu, { icon: 'folder-plus', label: '新目录', onClick: async () => {
         const p = prompt('目录路径(可嵌套,如 架构/网关):')
@@ -638,19 +776,20 @@ $btnNew.onclick = () => {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ path: p }),
         })).json()
-        if (r.ok) refreshFiles(); else alert(r.error)
+        if (r.ok) refreshFiles(); else toast(r.error, 'err')
       } })
     },
   })
 }
 
 // 移动核心(from→to),成功后当前文件跟随跳转
-async function moveTo(from, to, isDir) {
+// into=true 表示 to 是"目标文件夹"('' = 根目录);否则 to 是最终完整路径(重命名用)
+async function moveTo(from, to, isDir, into = false) {
   const r = await (await fetch('/api/move', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ from, to }),
+    body: JSON.stringify({ from, to, into }),
   })).json()
-  if (!r.ok) { alert(r.error); return false }
+  if (!r.ok) { toast(r.error, 'err'); return false }
   refreshFiles()
   const cur = currentFile()
   if (isDir ? (cur === from || cur.startsWith(from + '/')) : cur === from) {
@@ -659,10 +798,57 @@ async function moveTo(from, to, isDir) {
   }
   return true
 }
-async function moveItem(from, isDir) {
-  const to = prompt((isDir ? '移动目录,输入新完整路径:' : '移动文件,输入新完整路径:'), from)
-  if (!to || to === from) return
-  await moveTo(from, to, isDir)
+
+// 「移动」= 选一个文件夹(目标只能是文件夹,不接受手输路径)
+function moveItem(anchorBtn, from, isDir) {
+  const parentOf = (p) => p.split('/').slice(0, -1).join('')
+  const curParent = parentOf(from)
+  openedFolderPicker(anchorBtn, { from, isDir, curParent })
+}
+
+function openedFolderPicker(anchorBtn, { from, isDir, curParent }) {
+  // 目录本身及其子目录不能作为目标(移入自身会破坏树形结构)
+  const blocked = (d) => isDir && (d === from || d.startsWith(from + '/'))
+  openMenu(anchorBtn, {
+    left: r => Math.min(window.innerWidth - 250, Math.max(8, r.left - 150)),
+    build: (menu) => {
+      const head = document.createElement('div')
+      head.className = 'note-menu-empty'
+      head.style.textAlign = 'left'
+      head.textContent = '移动到文件夹:'
+      menu.appendChild(head)
+      const input = document.createElement('input')
+      input.placeholder = '过滤文件夹…'
+      const list = document.createElement('div')
+      list.className = 'note-menu-list'
+      const renderList = (q) => {
+        const ql = q.trim().toLowerCase()
+        list.innerHTML = ''
+        const all = [''].concat(dirsCache.filter(d => !blocked(d)))
+        const rows = all.filter(d => {
+          const label = d === '' ? '根目录' : d
+          return !ql || label.toLowerCase().includes(ql)
+        })
+        rows.forEach(d => {
+          const depth = d === '' ? 0 : d.split('/').length - 1
+          const isCur = d === curParent
+          const el = menuItem(list, {
+            icon: d === '' ? 'folder-open' : 'folder',
+            label: d === '' ? '根目录(顶层)' : d.split('/').pop(),
+            title: isCur ? '就是当前所在位置' : d || '根目录',
+            onClick: () => { if (!isCur) moveTo(from, d, isDir, true) },
+          })
+          el.style.paddingLeft = (10 + depth * 14) + 'px'
+          if (isCur) { el.style.opacity = '.45'; el.style.cursor = 'default' }
+        })
+        if (!rows.length) list.innerHTML = '<div class="note-menu-empty">没有可用的文件夹</div>'
+      }
+      input.oninput = () => renderList(input.value)
+      renderList('')
+      menu.appendChild(input)
+      menu.appendChild(list)
+    },
+  })
 }
 async function renameItem(path, isDir) {
   const oldName = path.split('/').pop()
@@ -679,7 +865,7 @@ async function deleteItem(path, isDir) {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ path }),
   })).json()
-  if (!r.ok) { alert(r.error); return }
+  if (!r.ok) { toast(r.error, 'err'); return }
   const cur = currentFile()
   if (cur === path || cur.startsWith(path + '/')) { location.hash = '#' + encodeURIComponent('欢迎.md'); openFile() }
   refreshFiles()
@@ -689,7 +875,7 @@ function openRowMenu(anchorBtn, path, isDir) {
   openMenu(anchorBtn, {
     left: r => Math.min(window.innerWidth - 200, Math.max(8, r.left - 150)),
     build: (menu) => {
-      menuItem(menu, { icon: 'right-left', label: '移动', onClick: () => moveItem(path, isDir) })
+      menuItem(menu, { icon: 'right-left', label: '移动', onClick: () => moveItem(anchorBtn, path, isDir) })
       menuItem(menu, { icon: 'pen-to-square', label: '重命名', onClick: () => renameItem(path, isDir) })
       menuItem(menu, { icon: 'trash-can', label: '删除', danger: true, onClick: () => deleteItem(path, isDir) })
     },
@@ -733,8 +919,129 @@ $btnLog.onclick = async () => {
   alert(res.ok ? `已恢复 (${res.chars} 字符),稍后自动写回文件(可点💾保存立即落盘)` : res.error)
 }
 
+// ---------- 编辑/预览 分隔条拖拽 ----------
+{
+  const splitter = document.getElementById('splitter')
+  const editorCol = document.getElementById('editor-col')
+  const preview = document.getElementById('preview')
+  if (splitter && editorCol && preview) {
+    // 恢复上次比例
+    const saved = localStorage.getItem('mdwiki-split')
+    if (saved) {
+      const [e, p] = saved.split(',').map(Number)
+      if (e > 0 && p > 0) { editorCol.style.flex = String(e); preview.style.flex = String(p) }
+    }
+    splitter.addEventListener('mousedown', (e) => {
+      e.preventDefault()
+      splitter.classList.add('active')
+      document.body.style.cursor = 'col-resize'
+      document.body.style.userSelect = 'none'
+      const startX = e.clientX
+      const startEW = editorCol.getBoundingClientRect().width
+      const startPW = preview.getBoundingClientRect().width
+      const total = startEW + startPW
+      const MIN_E = 150, MIN_P = 100   // 两侧最小宽度:拖到头就停住,任何一侧都不会被挤没
+      const onMove = (ev) => {
+        let eW = startEW + (ev.clientX - startX)
+        eW = Math.min(Math.max(eW, MIN_E), Math.max(MIN_E, total - MIN_P))
+        const pW = total - eW
+        // 用 flex 数值(而不是 px)保持弹性
+        editorCol.style.flex = String(+(eW / total).toFixed(3))
+        preview.style.flex = String(+(pW / total).toFixed(3))
+      }
+      const onUp = () => {
+        splitter.classList.remove('active')
+        document.body.style.cursor = ''
+        document.body.style.userSelect = ''
+        localStorage.setItem('mdwiki-split', editorCol.style.flex + ',' + preview.style.flex)
+        document.removeEventListener('mousemove', onMove)
+        document.removeEventListener('mouseup', onUp)
+      }
+      document.addEventListener('mousemove', onMove)
+      document.addEventListener('mouseup', onUp)
+    })
+    // 双击恢复默认 1:1
+    splitter.addEventListener('dblclick', () => {
+      editorCol.style.flex = '1'
+      preview.style.flex = '1'
+      localStorage.removeItem('mdwiki-split')
+    })
+  }
+}
+
 // ---------- 启动 ----------
-window.addEventListener('hashchange', () => { refreshFiles(); openFile() })
-applyTheme(themeMode) // 应用已保存的主题(含 body class 与按钮图标)
-refreshFiles()
-openFile()
+const IS_VIEW_MODE = location.pathname.startsWith('/view/')
+
+if (IS_VIEW_MODE) ; else {
+  window.addEventListener('hashchange', () => { refreshFiles(); openFile() })
+  applyTheme(themeMode)
+  // 先拿到文件列表再开文件:默认文件缺失时的回退依赖 filesCache 已就绪
+  ;(async () => { await refreshFiles(); openFile() })()
+  bindTreeEvents()
+}
+
+// ---------- 目录结构实时同步(别人的新建/移动/删除) ----------
+function bindTreeEvents() {
+  let timer = null
+  const es = new EventSource('/api/events')
+  es.onmessage = (ev) => {
+    let msg
+    try { msg = JSON.parse(ev.data) } catch { return }
+    if (msg.type !== 'tree') return
+    // 合并短时间内的多次变更,避免拖拽批量移动时反复重建
+    clearTimeout(timer)
+    timer = setTimeout(() => {
+      refreshFiles()
+      // 自己正打开的文件可能被移动/删除:静默跟随(openFile 内部会 resolve 并跳转)
+      resolvePath(currentFile()).then(r => { if (r.status !== 'ok') openFile() }).catch(() => {})
+    }, 250)
+  }
+  // EventSource 自带重连;断网恢复后第一次 onopen 补一次全量刷新
+  es.onerror = () => {}
+  es.onopen = () => { if (filesCache.length) refreshFiles() }
+}
+
+// 只读模式单独用 async IIFE(顶层 if 不能直接用 await)
+if (IS_VIEW_MODE) (async () => {
+  document.getElementById('sidebar').style.display = 'none'
+  document.getElementById('editor-col').style.display = 'none'
+  document.getElementById('splitter').style.display = 'none'
+  document.getElementById('btn-new').style.display = 'none'
+  document.getElementById('btn-save').style.display = 'none'
+  document.getElementById('btn-revision').style.display = 'none'
+  document.getElementById('btn-log').style.display = 'none'
+  document.getElementById('online').style.display = 'none'
+  const pv = document.getElementById('preview')
+  pv.style.display = ''
+  pv.style.maxWidth = '52rem'
+  pv.style.margin = '0 auto'
+  pv.style.padding = '40px 32px'
+  pv.style.width = '100%'
+  document.title = decodeURIComponent(location.pathname.slice(6)) + ' - mdwiki'
+  applyTheme(themeMode)
+  // 拉取内容并渲染(不建 WebSocket,纯静态渲染)
+  const file = decodeURIComponent(location.pathname.slice(6))
+  try {
+    const text = await (await fetch('/api/content?path=' + encodeURIComponent(file))).text()
+    let md = text
+    if (/^\[TOC\]$/m.test(md)) {
+      const tocLines = []
+      const walkToc = (toks) => toks.forEach(t => {
+        if (t.type === 'heading') tocLines.push('  '.repeat(Math.max(0, t.depth - 1)) + '- ' + t.text)
+        if (t.tokens) walkToc(t.tokens)
+      })
+      walkToc(marked.lexer(md))
+      md = md.replace(/^\[TOC\]$/gm, tocLines.join('\n'))
+    }
+    pv.innerHTML = DOMPurify.sanitize(marked.parse(md, { gfm: true, breaks: true }))
+    highlightPreview()
+    pv.querySelectorAll('a[href^="http"]').forEach(a => { a.target = '_blank'; a.rel = 'noopener' })
+    // 内链跳转到对应的只读视图
+    pv.querySelectorAll('a[href^="#"]').forEach(a => {
+      const href = a.getAttribute('href').slice(1)
+      if (href) a.href = '/view/' + href
+    })
+  } catch (e) {
+    pv.innerHTML = '<p style="color:#e0533d;text-align:center;margin-top:40vh">加载失败:' + e.message + '</p>'
+  }
+})()
