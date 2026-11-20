@@ -21,6 +21,14 @@ hljs.registerLanguage('yaml', hljsYaml)
 hljs.registerLanguage('bash', hljsBash)
 hljs.registerLanguage('typescript', hljsTs)
 
+// 只读页(view.html)是纯 script,不认识 ESM,这里把三个库挂到全局
+declare global {
+  interface Window {
+    marked: typeof marked
+    DOMPurify: typeof DOMPurify
+    hljs: typeof hljs
+  }
+}
 window.marked = marked
 window.DOMPurify = DOMPurify
 window.hljs = hljs

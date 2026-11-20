@@ -1,16 +1,20 @@
 # mdwiki-demo
 
-一个约 1300 行的自建知识库:**Markdown 文件为真相 + Yjs 实时协作 + git 版本**。
-无数据库、无 Docker,Node 单进程 + 磁盘目录即数据。
+一个约 1700 行的自建知识库:**Markdown 文件为真相 + Yjs 实时协作 + git 版本**。
+无数据库、无 Docker,**Bun 单进程 + TypeScript** + 磁盘目录即数据。
 
 ## 快速开始
 
 ```bash
-bun install        # 装依赖
-npm run build      # 构建前端(自动更新 index.html 版本号)
-npm start          # 启动 http://localhost:3320
-# 开发模式(构建 + 启动):npm run dev
+bun install          # 装依赖
+bun run build        # 构建前端(自动更新各页面资源版本号)
+bun run start        # 启动 http://localhost:3320
+bun run dev          # 构建 + 启动
+bun run typecheck    # tsc --noEmit(0 错误)
 ```
+
+服务端 `server.ts` 由 Bun 直接执行(原生 TypeScript,无编译步骤);前端两个入口
+`src/client.ts`(编辑页)与 `src/vendor.ts`(只读页依赖)由 `bun build` 打包。
 
 浏览器打开 http://localhost:3320 ,多个窗口各带 `?u=名字` 即可体验协作。
 
@@ -68,12 +72,13 @@ npm start          # 启动 http://localhost:3320
 ## 目录结构
 
 ```
-server.mjs          HTTP + WS + 房间/落盘/git/回收 + 只读视图(520 行)
-src/client.js       编辑器 + 协作 + UI(938 行)
-src/vendor.js       只读视图依赖打包入口(marked/DOMPurify/hljs,本地构建不依赖 CDN)
+server.ts           HTTP + WS + 房间/落盘/git/回收 + 只读视图(604 行,TS)
+src/client.ts       编辑器 + 协作 + UI(1058 行,TS)
+src/vendor.ts       只读视图依赖打包入口(marked/DOMPurify/hljs,本地构建不依赖 CDN)
+tsconfig.json       strict 模式,noEmit 类型检查
 public/index.html   编辑页;public/view.html 只读页
 public/code-theme.css  代码高亮配色(编辑预览与只读视图共用,保证两边一致)
-scripts/build.mjs   构建两个入口 + 自动更新各页面资源版本号
+scripts/build.ts    构建两个入口 + 自动更新各页面资源版本号
 notes/              数据目录(自身是一个 git 仓库)
 read-view/          只读视图的游离 worktree(HEAD 快照,与 notes/ 物理隔离)
 demo/               Agent 协作演示与压测脚本

@@ -1,10 +1,10 @@
-// build.mjs —— 构建前端 + 自动更新 HTML 里的资源版本号(消灭"忘改版本号拿到旧包"的人为失误)
+// build.ts —— 运行: bun scripts/build.ts 构建前端 + 自动更新 HTML 里的资源版本号(消灭"忘改版本号拿到旧包"的人为失误)
 import { spawnSync } from 'node:child_process'
 import fs from 'node:fs'
 
 const ENTRIES = [
-  { src: 'src/client.js', out: 'public/app.js' },     // 编辑页 SPA
-  { src: 'src/vendor.js', out: 'public/vendor.js' },  // 只读视图依赖(marked/DOMPurify/hljs)
+  { src: 'src/client.ts', out: 'public/app.js' },     // 编辑页 SPA
+  { src: 'src/vendor.ts', out: 'public/vendor.js' },  // 只读视图依赖(marked/DOMPurify/hljs)
 ]
 for (const { src, out } of ENTRIES) {
   const r = spawnSync('bun', ['build', src, '--outfile', out, '--minify'], { stdio: 'inherit' })

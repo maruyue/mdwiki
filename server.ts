@@ -1,11 +1,12 @@
-// mdwiki-demo server —— Node + 官方 y-websocket 协议层 + inode 身份架构
-// 运行: node server.mjs   (端口 3320)
+// mdwiki-demo server —— Bun/Node + 官方 y-websocket 协议层 + inode 身份架构
+// 运行: bun server.ts    (端口 3320)
 //
 // 架构(三层):
 //   实时层:Yjs 房间按 inode 键控 —— 移动/改名永不迁移房间(竞态从源头消失)
 //   映射层:registry(inode→当前路径,内存)+ redirects(旧路径→新路径,内存)
 //   持久层:磁盘文件 + git(按路径管历史;rename 记录即持久化改名台账)
 import http from 'node:http'
+import type { IncomingMessage, ServerResponse } from 'node:http'
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -13,11 +14,14 @@ import { spawnSync } from 'node:child_process'
 import { WebSocketServer } from 'ws'
 import { createRequire } from 'node:module'
 import * as encoding from 'lib0/encoding'
-// 与 utils.cjs 共用同一个 CJS yjs 实例
+import type { Duplex } from 'node:stream'
+
+// CJS 依赖(yjs / y-protocols / y-websocket utils.cjs)没有类型声明,统一按 any 使用
 const require = createRequire(import.meta.url)
-const Y = require('yjs')
-const awarenessProtocol = require('y-protocols/awareness')
-const hdUtils = require('./node_modules/y-websocket/bin/utils.cjs')
+/* eslint-disable @typescript-eslint/no-explicit-any */
+const Y: any = require('yjs')
+const awarenessProtocol: any = require('y-protocols/awareness')
+const hdUtils: any = require('./node_modules/y-websocket/bin/utils.cjs')
 
 const { setupWSConnection, getYDoc } = hdUtils
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -26,12 +30,24 @@ const NOTES = path.join(__dirname, 'notes')
 fs.mkdirSync(NOTES, { recursive: true }) // 全新克隆时数据目录可能不存在
 const YTEXT_KEY = 'codemirror'
 
+// ---------- 类型 ----------
+type Json = Record<string, any>
+type Headers = Record<string, string>
+type Reply = [number, Headers, string | Buffer]
+interface WalkResult { files: string[]; dirs: string[] }
+interface Room { doc: any; dirty: boolean; flushed: string | null; lastActive: number }
+interface ViewStatus { ok: boolean | null; head: string; syncedAt: string | null; error: string | null; trigger?: string }
+type ResolveResult = { status: 'ok' } | { status: 'moved'; to: string } | { status: 'gone' }
+interface MoveResult { from: string; ok: boolean; error?: string; to?: string }
+
+const errMsg = (e: unknown): string => (e instanceof Error ? e.message : String(e))
+
 // ---------- 工具 ----------
 const EXTS = ['.md', '.json', '.yaml', '.yml', '.js', '.ts', '.py', '.css', '.html', '.sh', '.txt']
 // 段校验:允许点文件/点目录;含 . .. .git(任意大小写)整条路径直接判非法(拒绝而非静默剥离)
 // 注意 macOS/APFS 卷不区分大小写,.Git 与 .git 是同一个目录 —— 必须大小写不敏感比对
-const badSeg = (s) => !s || s === '.' || s === '..' || s.toLowerCase() === '.git'
-const safePath = (n) => {
+const badSeg = (s: string): boolean => !s || s === '.' || s === '..' || s.toLowerCase() === '.git'
+const safePath = (n: unknown): string => {
   const segs = String(n || '').trim().split('/')
   if (segs.some(badSeg)) return ''
   const parts = segs.filter(Boolean)
@@ -41,21 +57,21 @@ const safePath = (n) => {
   const hasExt = EXTS.some(e => last.toLowerCase().endsWith(e))
   return [...parts, hasExt ? last : last + '.md'].join('/')
 }
-const safeDirPath = (n) => {
+const safeDirPath = (n: unknown): string => {
   const segs = String(n || '').trim().split('/')
   if (segs.some(badSeg)) return ''
   return segs.filter(Boolean).join('/')
 }
-const notePath = (n) => path.join(NOTES, n)
+const notePath = (n: string): string => path.join(NOTES, n)
 // 新建文件用 tmp+rename(原子);已存在文件必须原地写 —— rename 会换 inode,击穿房间身份
-const writeFileInPlace = (p, content) => fs.writeFileSync(p, content)
-const atomicWrite = (p, content) => {
+const writeFileInPlace = (p: string, content: string): void => { fs.writeFileSync(p, content) }
+const atomicWrite = (p: string, content: string): void => {
   fs.mkdirSync(path.dirname(p), { recursive: true })
   const tmp = p + '.tmp'
   fs.writeFileSync(tmp, content)
   fs.renameSync(tmp, p)
 }
-const walkNotes = (dir = NOTES, prefix = '', out = { files: [], dirs: [] }) => {
+const walkNotes = (dir: string = NOTES, prefix = '', out: WalkResult = { files: [], dirs: [] }): WalkResult => {
   for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
     if (e.name === '.git' || e.name === '.gitkeep') continue
     const rel = prefix ? `${prefix}/${e.name}` : e.name
@@ -66,16 +82,16 @@ const walkNotes = (dir = NOTES, prefix = '', out = { files: [], dirs: [] }) => {
 }
 // 启动世代号:每次进程启动生成一个;重启即变,客户端据此判断"房间历史已重建"
 const EPOCH = Date.now().toString(36) + Math.random().toString(36).slice(2, 6)
-const gitRun = (...args) => spawnSync('git', ['-c', 'core.quotepath=false', '-C', NOTES, ...args], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 })
-const gitOut = (...args) => gitRun(...args).stdout.trim()
-const inodeKeyOf = (p) => { const st = fs.statSync(p); return `${st.dev}-${st.ino}` }
+const gitRun = (...args: string[]) => spawnSync('git', ['-c', 'core.quotepath=false', '-C', NOTES, ...args], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 })
+const gitOut = (...args: string[]): string => gitRun(...args).stdout.trim()
+const inodeKeyOf = (p: string): string => { const st = fs.statSync(p); return `${st.dev}-${st.ino}` }
 
 // ---------- 只读视图(git worktree --detach):永远展示 HEAD 快照 ----------
 // 编辑端(内存房间/工作区)与只读端物理隔离:同步只动 ../read-view,不碰 notes/
 const VIEW_DIR = path.join(__dirname, '..', 'read-view')
 let viewSyncing = false
-let viewStatus = { ok: null, head: '', syncedAt: null, error: null }
-function refreshReadView(trigger) {
+let viewStatus: ViewStatus = { ok: null, head: '', syncedAt: null, error: null }
+function refreshReadView(trigger: string): ViewStatus {
   if (viewSyncing) return viewStatus
   viewSyncing = true
   try {
@@ -90,10 +106,10 @@ function refreshReadView(trigger) {
       if (r.status !== 0) throw new Error('reset 失败: ' + (r.stderr || '').trim().slice(0, 120))
     }
     // 游离 worktree 与主仓共享对象库,reset 后 main 引用对它可见;无需 fetch
-    viewStatus = { ok: true, head: gitOut('-C', VIEW_DIR, 'rev-parse', '--short', 'HEAD'), syncedAt: new Date().toISOString(), trigger }
+    viewStatus = { ok: true, head: gitOut('-C', VIEW_DIR, 'rev-parse', '--short', 'HEAD'), syncedAt: new Date().toISOString(), error: null, trigger }
   } catch (e) {
-    viewStatus = { ok: false, head: viewStatus.head, syncedAt: viewStatus.syncedAt, error: e.message, trigger }
-    console.log('[view-sync] ' + e.message)
+    viewStatus = { ok: false, head: viewStatus.head, syncedAt: viewStatus.syncedAt, error: errMsg(e), trigger }
+    console.log('[view-sync] ' + errMsg(e))
   }
   viewSyncing = false
   return viewStatus
@@ -102,16 +118,16 @@ function refreshReadView(trigger) {
 setInterval(() => refreshReadView('auto'), 60 * 1000)
 
 // ---------- 房间:按 inode 键控 ----------
-const rooms = new Map()      // inodeKey -> { doc, dirty, flushed }
-const registry = new Map()   // inodeKey -> 当前路径(移动时一条赋值,房间不动)
-const redirects = new Map()  // 旧路径 -> 新路径(内存;跨重启由 git rename 记录兜底)
+const rooms = new Map<string, Room>()      // inodeKey -> { doc, dirty, flushed, lastActive }
+const registry = new Map<string, string>() // inodeKey -> 当前路径(移动时一条赋值,房间不动)
+const redirects = new Map<string, string>() // 旧路径 -> 新路径(内存;跨重启由 git rename 记录兜底)
 
-function getRoom(inodeKey, filePath) {
+function getRoom(inodeKey: string, filePath: string): Room {
   registry.set(inodeKey, filePath) // 恒以最新为准,自愈陈旧条目
-  let room = rooms.get(inodeKey)
-  if (room) return room
+  const existing = rooms.get(inodeKey)
+  if (existing) return existing
   const doc = getYDoc(inodeKey) // 官方 WSSharedDoc
-  room = { doc, dirty: false, flushed: null, lastActive: Date.now() }
+  const room: Room = { doc, dirty: false, flushed: null, lastActive: Date.now() }
   rooms.set(inodeKey, room)
   const p = notePath(filePath)
   if (fs.existsSync(p) && doc.getText(YTEXT_KEY).length === 0) {
@@ -125,11 +141,11 @@ function getRoom(inodeKey, filePath) {
 
 // ---------- 落盘(60 秒定时 + 存版本前强制全量) ----------
 // force=true:忽略 dirty 标记,把所有房间与磁盘的差异写下去(commit 前调用)
-function flushAll(force = false) {
+function flushAll(force = false): number {
   let written = 0
   for (const [inodeKey, room] of rooms) {
     if (!force && !room.dirty) continue
-    const text = room.doc.getText(YTEXT_KEY).toString()
+    const text: string = room.doc.getText(YTEXT_KEY).toString()
     // 注:曾有过"精确翻倍自愈"守卫(检测 text[:n/2]==text[n/2:] 时减半)。
     // 已移除 —— ①重启造成的翻倍已被"连接锁 + 世代号"从源头阻断;
     // ②该启发式会误伤合法内容(两段相同的模板/示例会被静默截断),代价大于收益。
@@ -147,7 +163,7 @@ function flushAll(force = false) {
       }
       room.flushed = text
     } catch (e) {
-      console.log(`[flush-retry] ${filePath}: ${e.message}`) // 撞上 rename 瞬间,下次用新路径重写
+      console.log(`[flush-retry] ${filePath}: ${errMsg(e)}`) // 撞上 rename 瞬间,下次用新路径重写
     }
     room.dirty = false
   }
@@ -170,12 +186,12 @@ setInterval(() => {
     // 回收前兜底落盘(正常情况下 60 秒定时器已写过,这里防漏)
     try {
       if (filePath) {
-        const text = room.doc.getText(YTEXT_KEY).toString()
+        const text: string = room.doc.getText(YTEXT_KEY).toString()
         const p = notePath(filePath)
         if (fs.existsSync(p) && fs.readFileSync(p, 'utf8') !== text) { writeFileInPlace(p, text); console.log(`[evict-flush] ${filePath}`) }
       }
       room.doc.destroy()
-    } catch (e) { console.log(`[evict] 回收失败 ${inodeKey}: ${e.message}`) }
+    } catch (e) { console.log(`[evict] 回收失败 ${inodeKey}: ${errMsg(e)}`) }
     rooms.delete(inodeKey)
     registry.delete(inodeKey)
     console.log(`[evict] 空闲回收房间 ${filePath || inodeKey}`)
@@ -185,35 +201,36 @@ setInterval(() => {
 // ---------- awareness 保活 ----------
 setInterval(() => {
   for (const room of rooms.values()) {
-    const ids = [...room.doc.awareness.getStates().keys()]
+    const ids = [...room.doc.awareness.getStates().keys()] as number[]
     if (!ids.length || !room.doc.conns.size) continue
     const enc = encoding.createEncoder()
     encoding.writeVarUint(enc, 1)
     encoding.writeVarUint8Array(enc, awarenessProtocol.encodeAwarenessUpdate(room.doc.awareness, ids))
     const snap = encoding.toUint8Array(enc)
-    for (const [conn] of room.doc.conns) conn.send(snap, { binary: true })
+    for (const [conn] of room.doc.conns) (conn as any).send(snap, { binary: true })
   }
 }, 10000)
 
 // ---------- HTTP ----------
-const json = (obj, status = 200) => [status, { 'Content-Type': 'application/json; charset=utf-8' }, JSON.stringify(obj)]
-const readBody = (req) => new Promise(resolve => {
+const json = (obj: unknown, status = 200): Reply => [status, { 'Content-Type': 'application/json; charset=utf-8' }, JSON.stringify(obj)]
+const readBody = (req: IncomingMessage): Promise<Json> => new Promise(resolve => {
   let d = ''
-  req.on('data', c => (d += c))
-  req.on('end', () => { try { resolve(JSON.parse(d || '{}')) } catch { resolve({}) } })
+  req.on('data', (c: Buffer | string) => { d += c })
+  req.on('end', () => { try { resolve(JSON.parse(d || '{}') as Json) } catch { resolve({}) } })
 })
-const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.css': 'text/css', '.svg': 'image/svg+xml' }
+const MIME: Record<string, string> = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.css': 'text/css', '.svg': 'image/svg+xml' }
 
 // rename 对(最新在前)。注意:带 pathspec 查旧路径时 git 只显示 D,必须全库扫 R 再自行配对
-function renamePairs() {
+function renamePairs(): Array<[string, string]> {
   const r = gitRun('log', '--name-status', '--diff-filter=R', '-n', '500', '--format=%H')
-  return [...r.stdout.matchAll(/^R\d+\t(.+?)\t(.+)$/gm)].map(m => [m[1].trim(), m[2].trim()])
+  return [...r.stdout.matchAll(/^R\d+\t(.+?)\t(.+)$/gm)].map(m => [m[1].trim(), m[2].trim()] as [string, string])
 }
 // 路径现状:ok / moved(带新路径)/ gone。两级:内存表 → git rename 记录
-function resolvePath(file) {
+function resolvePath(file: string): ResolveResult {
   if (!file) return { status: 'gone' }
   if (fs.existsSync(notePath(file))) return { status: 'ok' }
-  if (redirects.has(file)) return { status: 'moved', to: redirects.get(file) }
+  const memTo = redirects.get(file)
+  if (memTo) return { status: 'moved', to: memTo }
   const hit = renamePairs().find(([oldP]) => oldP === file)
   if (hit) {
     const to = hit[1]
@@ -222,7 +239,7 @@ function resolvePath(file) {
   return { status: 'gone' }
 }
 // 沿 rename 链解析 commit 时刻的旧路径(a→b→c,当前是 c)
-function historicalPath(commit, file, depth = 5) {
+function historicalPath(commit: string, file: string, depth = 5): string | null {
   const lsTree = gitRun('ls-tree', '--name-only', commit, '--', file)
   if (lsTree.status === 0 && lsTree.stdout.trim() === file) return file
   if (depth <= 0) return null
@@ -236,8 +253,8 @@ function historicalPath(commit, file, depth = 5) {
 }
 
 // ---------- SSE:目录结构变更广播 ----------
-const sseClients = new Set()
-function broadcastTree(reason) {
+const sseClients = new Set<ServerResponse>()
+function broadcastTree(reason: string): void {
   const msg = `data: ${JSON.stringify({ type: 'tree', reason })}\n\n`
   for (const res of sseClients) { try { res.write(msg) } catch { sseClients.delete(res) } }
 }
@@ -245,12 +262,12 @@ function broadcastTree(reason) {
 setInterval(() => { for (const res of sseClients) { try { res.write(': ping\n\n') } catch { sseClients.delete(res) } } }, 25 * 1000)
 
 // 结构指纹:只有"文件/目录集合"真变了才广播(内容落盘不会触发多余刷新)
-let lastTreeSig = null
-const treeSignature = () => {
+let lastTreeSig: string | null = null
+const treeSignature = (): string => {
   const w = walkNotes()
   return w.files.slice().sort().join('\n') + '|' + w.dirs.slice().sort().join('\n')
 }
-function noteTreeChanged(reason) {
+function noteTreeChanged(reason: string): void {
   const sig = treeSignature()
   if (sig === lastTreeSig) return
   lastTreeSig = sig
@@ -259,21 +276,21 @@ function noteTreeChanged(reason) {
 lastTreeSig = treeSignature()
 
 // 磁盘监听兜底:外部编辑器 / git pull / Agent 脚本直接写文件,同样及时通知
-let watchTimer = null
+let watchTimer: ReturnType<typeof setTimeout> | null = null
 try {
   fs.watch(NOTES, { recursive: true }, (_ev, filename) => {
     const first = String(filename || '').split(path.sep)[0]
     if (first === '.git') return   // git 内部文件不关心
-    clearTimeout(watchTimer)
+    if (watchTimer) clearTimeout(watchTimer)
     watchTimer = setTimeout(() => {
-      try { noteTreeChanged('fs') } catch (e) { console.log('[watch] ' + e.message) }
+      try { noteTreeChanged('fs') } catch (e) { console.log('[watch] ' + errMsg(e)) }
     }, 500)
   })
-} catch (e) { console.log('[watch] 目录监听不可用: ' + e.message) }
+} catch (e) { console.log('[watch] 目录监听不可用: ' + errMsg(e)) }
 
-const server = http.createServer(async (req, res) => {
-  const url = new URL(req.url, 'http://x')
-  const [status, headers, body] = await (async () => {
+const server = http.createServer(async (req: IncomingMessage, res: ServerResponse) => {
+  const url = new URL(req.url || '/', 'http://x')
+  const reply: Reply | null = await (async (): Promise<Reply | null> => {
     try {
       if (url.pathname === '/api/files' && req.method === 'GET') {
         const w = walkNotes()
@@ -289,7 +306,7 @@ const server = http.createServer(async (req, res) => {
         res.write(': connected\n\n')
         sseClients.add(res)
         req.on('close', () => sseClients.delete(res))
-        return [null] // 长连接:已自行接管响应,跳过下面的 writeHead/end
+        return null // 长连接:已自行接管响应,跳过下面的 writeHead/end
       }
       if (url.pathname === '/api/resolve' && req.method === 'GET') {
         const file = safePath(url.searchParams.get('path') || '')
@@ -352,7 +369,7 @@ const server = http.createServer(async (req, res) => {
         if (!from) return json({ ok: false, error: '非法源路径' }, 400)
         const src = notePath(from)
         if (!fs.existsSync(src)) return json({ ok: false, error: '源不存在' }, 404)
-        let toRel
+        let toRel: string
         if (b.into === true) {
           // 「移动到文件夹」语义:目标必须是已存在的目录('' 或 '/' = 根目录),文件名保持不变
           const toDir = (to === '' || to === '/') ? '' : safeDirPath(to)
@@ -360,7 +377,7 @@ const server = http.createServer(async (req, res) => {
           const absTo = toDir ? notePath(toDir) : NOTES
           if (!fs.existsSync(absTo) || !fs.statSync(absTo).isDirectory()) return json({ ok: false, error: '目标不是文件夹' }, 400)
           if (isDir && (toDir === from || (toDir && toDir.startsWith(from + '/')))) return json({ ok: false, error: '不能移入自身或子目录' }, 400)
-          toRel = toDir ? toDir + '/' + from.split('/').pop() : from.split('/').pop()
+          toRel = toDir ? toDir + '/' + from.split('/').pop() : from.split('/').pop() as string
         } else {
           // 完整路径语义(重命名等):目标就是最终路径,保持原行为
           toRel = isDir ? safeDirPath(to) : safePath(to)
@@ -370,8 +387,8 @@ const server = http.createServer(async (req, res) => {
         const dst = notePath(toRel)
         if (dst !== src && fs.existsSync(dst)) return json({ ok: false, error: '目标已存在' }, 409)
         // 房间层零迁移:先记 inode,搬文件,然后一条赋值更新注册表
-        let inodeKey = null
-        if (!isDir) { try { inodeKey = inodeKeyOf(src) } catch {} }
+        let inodeKey: string | null = null
+        if (!isDir) { try { inodeKey = inodeKeyOf(src) } catch { /* 取不到就退化为路径更新 */ } }
         fs.mkdirSync(path.dirname(dst), { recursive: true })
         fs.renameSync(src, dst)
         if (isDir) {
@@ -393,7 +410,7 @@ const server = http.createServer(async (req, res) => {
       if (url.pathname === '/api/move-batch' && req.method === 'POST') {
         // 批量移动:{ items: [{from, isDir}], to: '目标目录' (''=根) }
         const b = await readBody(req)
-        const items = Array.isArray(b.items) ? b.items : []
+        const items: Json[] = Array.isArray(b.items) ? b.items as Json[] : []
         const destDir = b.to === '' || b.to === '/' ? '' : safeDirPath(b.to)
         if (!items.length || destDir === null) return json({ ok: false, error: '参数错误' }, 400)
         // 目标只能是已存在的文件夹(根目录除外):不允许落到文件上或凭空造目录
@@ -401,7 +418,7 @@ const server = http.createServer(async (req, res) => {
           const absDest = notePath(destDir)
           if (!fs.existsSync(absDest) || !fs.statSync(absDest).isDirectory()) return json({ ok: false, error: '目标不是文件夹' }, 400)
         }
-        const results = []
+        const results: MoveResult[] = []
         for (const it of items) {
           const rawFrom = String(it.from || '').trim()
           if (rawFrom === '.gitignore') { results.push({ from: rawFrom, ok: false, error: '根目录 .gitignore 不能移动' }); continue }
@@ -413,16 +430,16 @@ const server = http.createServer(async (req, res) => {
           const src = notePath(from)
           if (!fs.existsSync(src)) { results.push({ from, ok: false, error: '不存在' }); continue }
           // 目标:目录名拼 basename;文件名保持原名
-          const base = from.split('/').pop()
+          const base = from.split('/').pop() as string
           const toRel = destDir ? destDir + '/' + base : base
           const dst = notePath(toRel)
           // 禁止移入自身或自己的子目录
           if (isDir && (toRel === from || toRel.startsWith(from + '/'))) { results.push({ from, ok: false, error: '不能移入自身' }); continue }
           if (dst !== src && fs.existsSync(dst)) { results.push({ from, ok: false, error: '目标已存在:' + toRel }); continue }
-          let inodeKey = null
-          if (!isDir) { try { inodeKey = inodeKeyOf(src) } catch {} }
+          let inodeKey: string | null = null
+          if (!isDir) { try { inodeKey = inodeKeyOf(src) } catch { /* 退化 */ } }
           fs.mkdirSync(path.dirname(dst), { recursive: true })
-          try { fs.renameSync(src, dst) } catch (e) { results.push({ from, ok: false, error: e.message }); continue }
+          try { fs.renameSync(src, dst) } catch (e) { results.push({ from, ok: false, error: errMsg(e) }); continue }
           if (isDir) {
             for (const [k, p] of [...registry]) {
               if (p === from || p.startsWith(from + '/')) { registry.set(k, toRel + p.slice(from.length)); redirects.set(p, toRel + p.slice(from.length)) }
@@ -450,8 +467,8 @@ const server = http.createServer(async (req, res) => {
             const room = rooms.get(k)
             if (room) {
               // 先踢掉所有连接(4002):否则旧标签页会"挂着已销毁的房间"继续编辑,内容写进虚空
-              for (const [conn] of room.doc.conns) { try { conn.close(4002, 'file-deleted') } catch {} }
-              try { room.doc.destroy() } catch {}
+              for (const [conn] of room.doc.conns) { try { (conn as any).close(4002, 'file-deleted') } catch { /* 已断开 */ } }
+              try { room.doc.destroy() } catch { /* 已销毁 */ }
               rooms.delete(k)
             }
             registry.delete(k)
@@ -494,7 +511,7 @@ const server = http.createServer(async (req, res) => {
         const file = safePath(b.file), commit = String(b.commit || '')
         if (!file || !/^[\w.-]+$/.test(commit)) return json({ ok: false, error: '参数错误' }, 400)
         // 跨移动回滚:先试当前路径,不行沿 rename 链找该提交时的旧名字
-        let content = null
+        let content: string | null = null
         const r0 = gitRun('show', `${commit}:${file}`)
         if (r0.status === 0) content = r0.stdout
         else {
@@ -523,16 +540,16 @@ const server = http.createServer(async (req, res) => {
         // pending:工作区里尚未提交的改动数。只读视图只看 HEAD,不提示会让用户以为"目录/文件丢了"
         const out = gitRun('status', '--porcelain').stdout || ''
         const pending = out.split('\n').filter(l => l.trim()).length
-        return json({ ok: true, ...viewStatus, pending })
+        return json({ ...viewStatus, ok: true, pending })
       }
       if (url.pathname === '/view-api/refresh' && req.method === 'POST') {
         const st = refreshReadView('manual')
-        return json({ ok: st.ok !== false, ...st })
+        return json({ ...st, ok: st.ok !== false })
       }
       if (url.pathname === '/view-api/files' && req.method === 'GET') {
         // 从 worktree 递归列出白名单文件(不读内存、不读 notes/ 工作区)
-        const list = (dir = VIEW_DIR, prefix = '') => {
-          const out = []
+        const list = (dir: string = VIEW_DIR, prefix = ''): string[] => {
+          const out: string[] = []
           for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
             if (e.name === '.git' || e.name === '.gitkeep') continue   // .git 是文件(worktree 指针),也要跳
             const rel = prefix ? `${prefix}/${e.name}` : e.name
@@ -559,25 +576,26 @@ const server = http.createServer(async (req, res) => {
         if (fs.existsSync(f)) return [200, { 'Content-Type': MIME['.html'] }, fs.readFileSync(f)]
       }
       // 静态文件
-      const rel = url.pathname === '/' ? '/index.html' : url.pathname
-      const f = path.join(__dirname, 'public', rel)
+      const staticRel = url.pathname === '/' ? '/index.html' : url.pathname
+      const f = path.join(__dirname, 'public', staticRel)
       if (f.startsWith(path.join(__dirname, 'public')) && fs.existsSync(f) && fs.statSync(f).isFile()) {
         return [200, { 'Content-Type': MIME[path.extname(f)] || 'application/octet-stream' }, fs.readFileSync(f)]
       }
       return [404, { 'Content-Type': 'text/plain' }, 'not found']
     } catch (e) {
-      return [500, { 'Content-Type': 'application/json' }, JSON.stringify({ ok: false, error: e.message })]
+      return [500, { 'Content-Type': 'application/json' }, JSON.stringify({ ok: false, error: errMsg(e) })]
     }
   })()
-  if (status === null) return   // SSE 长连接已自行接管响应
+  if (!reply) return   // SSE 长连接已自行接管响应
+  const [status, headers, body] = reply
   res.writeHead(status, headers)
   res.end(body)
 })
 
 // ---------- WebSocket 升级:路径 → inode → 房间 ----------
 const wss = new WebSocketServer({ noServer: true })
-server.on('upgrade', (req, socket, head) => {
-  const url = new URL(req.url, 'http://x')
+server.on('upgrade', (req: IncomingMessage, socket: Duplex, head: Buffer) => {
+  const url = new URL(req.url || '/', 'http://x')
   if (!url.pathname.startsWith('/ws/')) return socket.destroy()
   const file = safePath(decodeURIComponent(url.pathname.slice(4)))
   if (!file || !fs.existsSync(notePath(file))) {
@@ -585,14 +603,14 @@ server.on('upgrade', (req, socket, head) => {
     return socket.destroy()
   }
   const clientEpoch = url.searchParams.get('epoch')
-  let inodeKey
+  let inodeKey: string
   try { inodeKey = inodeKeyOf(notePath(file)) } catch { return socket.destroy() }
   wss.handleUpgrade(req, socket, head, (ws) => {
     // 世代不符 = 客户端带着"重启前"的旧历史 —— 拒绝同步(4001),由客户端丢弃本地状态重载
     // 若放行,旧历史会被当成新内容并入从磁盘重建的房间 → 两版叠加(非精确形态无法自动修复)
     if (clientEpoch && clientEpoch !== EPOCH) {
       console.log(`[epoch-reject] ${file}: 客户端世代 ${clientEpoch} ≠ 服务端 ${EPOCH}`)
-      try { ws.close(4001, 'epoch-mismatch') } catch {}
+      try { ws.close(4001, 'epoch-mismatch') } catch { /* 已关闭 */ }
       return
     }
     getRoom(inodeKey, file)

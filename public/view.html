@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <title>mdwiki · 只读视图</title>
-<link rel="stylesheet" href="/code-theme.css?v=1795163045499">
+<link rel="stylesheet" href="/code-theme.css?v=1795165224077">
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -52,6 +52,8 @@
   body.light #content code { color: #a31515; }
   #content pre { background: var(--pre-bg); border: 1px solid var(--border); border-radius: 8px; padding: 13px 16px; overflow: auto; margin: .9em 0; }
   #content pre code { background: none; padding: 0; color: var(--fg); font-size: .87em; }
+  /* 非 md 文件:整篇就是一个代码块,不该套"代码框"(那是 markdown 内嵌代码块的样式) */
+  #content.doc-view pre { background: none; border: 0; border-radius: 0; padding: 0; margin: 0; }
   #content blockquote { border-left: 4px solid var(--border2); padding: 6px 16px; margin: .8em 0; color: var(--fg-dim); }
   #content table { border-collapse: collapse; margin: .9em 0; }
   #content th, #content td { border: 1px solid var(--border2); padding: 6px 13px; }
@@ -73,7 +75,7 @@
   <nav id="sidebar"></nav>
   <div id="content"><div id="empty">从左侧选择文件,或先在编辑端「📷 存版本」产生提交</div></div>
 </main>
-<script src="/vendor.js?v=1795163045499"></script>
+<script src="/vendor.js?v=1795165224077"></script>
 <script>
 // 只读视图:全部数据来自 /view-api(读 worktree 的 HEAD 快照,与编辑端物理隔离)
 const $sidebar = document.getElementById('sidebar')
@@ -182,9 +184,11 @@ async function loadFile() {
     }
     const text = await resp.text()
     if (f.endsWith('.md')) {
+      $content.classList.remove('doc-view')
       $content.innerHTML = DOMPurify.sanitize(marked.parse(text, { gfm: true, breaks: true }))
       highlightCode($content)
     } else {
+      $content.classList.add('doc-view')
       const esc = text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
       const lang = (f.match(/\.([a-z0-9]+)$/i)?.[1] || '').replace('yml', 'yaml')
       $content.innerHTML = `<pre><code class="language-${lang}">${esc}</code></pre>`

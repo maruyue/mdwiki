@@ -2,6 +2,7 @@
 import { EditorView, basicSetup } from 'codemirror'
 import { keymap } from '@codemirror/view'
 import { Compartment, EditorState } from '@codemirror/state'
+import type { Extension } from '@codemirror/state'
 import { HighlightStyle, syntaxHighlighting, LanguageDescription } from '@codemirror/language'
 import { tags } from '@lezer/highlight'
 import { json } from '@codemirror/lang-json'
@@ -11,6 +12,7 @@ import { javascript } from '@codemirror/lang-javascript'
 import { python } from '@codemirror/lang-python'
 import { css } from '@codemirror/lang-css'
 import { html } from '@codemirror/lang-html'
+import { markdown } from '@codemirror/lang-markdown'
 import hljs from 'highlight.js/lib/core'
 import hljsJson from 'highlight.js/lib/languages/json'
 import hljsJs from 'highlight.js/lib/languages/javascript'
@@ -20,6 +22,22 @@ import hljsXml from 'highlight.js/lib/languages/xml'
 import hljsYaml from 'highlight.js/lib/languages/yaml'
 import hljsBash from 'highlight.js/lib/languages/bash'
 import hljsTs from 'highlight.js/lib/languages/typescript'
+import * as Y from 'yjs'
+import { WebsocketProvider } from 'y-websocket'
+import { yCollab } from 'y-codemirror.next'
+import { marked } from 'marked'
+import DOMPurify from 'dompurify'
+
+// ---------- 接口返回类型 ----------
+interface FilesResp { ok: boolean; files: string[]; dirs: string[] }
+interface MoveResult { from: string; ok: boolean; error?: string; to?: string }
+interface MoveBatchResp { ok: boolean; moved: number; total: number; results: MoveResult[] }
+interface SimpleResp { ok: boolean; error?: string; [k: string]: unknown }
+type ResolveStatus = 'ok' | 'moved' | 'gone' | 'offline'
+interface ResolveResp { status: ResolveStatus; to?: string }
+type DragItem = { from: string; isDir: boolean }
+type ThemeMode = 'dark' | 'light'
+interface TreeNode { __path?: string; __files?: { name: string; full: string }[]; [k: string]: unknown }
 
 // 编辑器内嵌语言(markdown 围栏代码块高亮)。load 必须返回 Promise<LanguageSupport>
 const CODE_LANGS = [
@@ -32,8 +50,8 @@ const CODE_LANGS = [
 ]
 
 // 按文件扩展名选择编辑器语言
-const extOf = (f) => (f.match(/\.([a-z0-9]+)$/i)?.[1] || 'md').toLowerCase()
-function langForFile(file) {
+const extOf = (f: string): string => (f.match(/\.([a-z0-9]+)$/i)?.[1] || 'md').toLowerCase()
+function langForFile(file: string): Extension[] {
   switch (extOf(file)) {
     case 'json': return [json()]
     case 'yaml': case 'yml': return [yaml()]
@@ -47,20 +65,21 @@ function langForFile(file) {
   }
 }
 // 格式化(当前仅 json/yaml);结果直接显示在按钮右侧,不弹对话框
-function fmtMsg(text, ok) {
+let fmtTimer: ReturnType<typeof setTimeout> | null = null
+function fmtMsg(text: string, ok: boolean): void {
   const el = document.getElementById('fmt-status')
   if (!el) return
   el.textContent = text
   el.className = ok ? 'fmt-ok' : 'fmt-err'
-  clearTimeout(fmtMsg._t)
-  fmtMsg._t = setTimeout(() => { el.textContent = ''; el.className = '' }, ok ? 2500 : 8000)
+  if (fmtTimer) clearTimeout(fmtTimer)
+  fmtTimer = setTimeout(() => { el.textContent = ''; el.className = '' }, ok ? 2500 : 8000)
 }
-function formatDoc() {
-  if (connLocked) { fmtMsg('连接已断开,无法编辑', false); return }
+function formatDoc(): void {
+  if (connLocked || !view) { fmtMsg('连接已断开,无法编辑', false); return }
   const file = currentFile()
   const text = view.state.doc.toString()
   try {
-    let out = null
+    let out: string
     if (extOf(file) === 'json') out = JSON.stringify(JSON.parse(text), null, 2) + '\n'
     else if (extOf(file) === 'yaml' || extOf(file) === 'yml') out = YAML.stringify(YAML.parse(text))
     else { fmtMsg('暂不支持该格式(支持 json / yaml)', false); return }
@@ -68,7 +87,7 @@ function formatDoc() {
     view.focus()
     fmtMsg('✓ 已格式化', true)
   } catch (e) {
-    const msg = String(e.message || e).split('\n')[0] // 解析错误只显示第一行
+    const msg = String(e instanceof Error ? e.message : e).split('\n')[0] // 解析错误只显示第一行
     fmtMsg('格式化失败:' + msg, false)
   }
 }
@@ -82,15 +101,15 @@ hljs.registerLanguage('xml', hljsXml)
 hljs.registerLanguage('yaml', hljsYaml)
 hljs.registerLanguage('bash', hljsBash)
 hljs.registerLanguage('typescript', hljsTs)
-function highlightPreview() {
-  document.querySelectorAll('#preview pre code').forEach(el => {
+function highlightPreview(): void {
+  document.querySelectorAll<HTMLElement>('#preview pre code').forEach(el => {
     if (!el.dataset.hl) { try { hljs.highlightElement(el) } catch { /* 未知语言保持原样 */ } el.dataset.hl = '1' }
   })
 }
 
 // ---------- VSCode 风格主题:Dark+ / Light+(行距 1.75) ----------
 const MONO = '"SF Mono", Menlo, Monaco, "Cascadia Code", Consolas, "Courier New", monospace'
-const cmTheme = (fg, bg, caret, selBg, activeLine, gutterFg, foldBg, tooltip) => EditorView.theme({
+const cmTheme = (fg: string, bg: string, caret: string, selBg: string, activeLine: string, gutterFg: string, foldBg: string, tooltip: string) => EditorView.theme({
   '&': { color: fg, backgroundColor: bg },
   '.cm-content': { fontFamily: MONO, fontSize: '14px', lineHeight: '1.75', padding: '14px 4px' },
   '.cm-line': { padding: '0 12px' },
@@ -103,7 +122,7 @@ const cmTheme = (fg, bg, caret, selBg, activeLine, gutterFg, foldBg, tooltip) =>
   '.cm-selectionMatch': { backgroundColor: foldBg },
   '.cm-tooltip': { backgroundColor: tooltip, border: '1px solid var(--border2)', color: 'var(--fg)' },
 })
-const mdStyle = (heading, strong, emphasis, strike, mono, link, quote) => HighlightStyle.define([
+const mdStyle = (heading: string, strong: string, emphasis: string, strike: string, mono: string, link: string, quote: string) => HighlightStyle.define([
   { tag: tags.heading1, color: heading, fontWeight: '700', fontSize: '1.25em' },
   { tag: tags.heading2, color: heading, fontWeight: '700', fontSize: '1.12em' },
   { tag: [tags.heading3, tags.heading4, tags.heading5, tags.heading6], color: heading, fontWeight: '700' },
@@ -118,7 +137,7 @@ const mdStyle = (heading, strong, emphasis, strike, mono, link, quote) => Highli
   { tag: tags.processingInstruction, color: quote },
 ])
 // 通用代码 token 色板(json/yaml/js/py 等共享:字符串/数字/布尔/属性名/关键字)
-const codeStyle = (str, num, bool, prop, kw, comment) => HighlightStyle.define([
+const codeStyle = (str: string, num: string, bool: string, prop: string, kw: string, comment: string) => HighlightStyle.define([
   { tag: [tags.string, tags.special(tags.string)], color: str },
   { tag: tags.number, color: num },
   { tag: [tags.bool, tags.null], color: bool },
@@ -126,7 +145,7 @@ const codeStyle = (str, num, bool, prop, kw, comment) => HighlightStyle.define([
   { tag: [tags.keyword, tags.moduleKeyword, tags.operator], color: kw },
   { tag: [tags.lineComment, tags.blockComment], color: comment, fontStyle: 'italic' },
 ])
-const themeExt = {
+const themeExt: Record<ThemeMode, Extension[]> = {
   dark: [cmTheme('#d4d4d4', '#1e1e1e', '#aeafad', '#264f78', 'rgba(255,255,255,0.045)', '#6e7681', '#37373d', '#252526'),
          syntaxHighlighting(mdStyle('#569cd6', '#e8e8e8', '#d7ba7d', '#808080', '#ce9178', '#4daafc', '#6a9955')),
          syntaxHighlighting(codeStyle('#ce9178', '#b5cea8', '#569cd6', '#9cdcfe', '#c586c0', '#6a9955'))],
@@ -135,22 +154,17 @@ const themeExt = {
           syntaxHighlighting(codeStyle('#a31515', '#098658', '#0000ff', '#0451a5', '#af00db', '#008000'))],
 }
 const themeComp = new Compartment()
-let themeMode = localStorage.getItem('mdwiki-theme') || 'dark'
+const THEME_KEY = 'mdwiki-theme'
+let themeMode: ThemeMode = (localStorage.getItem(THEME_KEY) === 'light' ? 'light' : 'dark')
 
-function applyTheme(mode) {
+function applyTheme(mode: ThemeMode): void {
   themeMode = mode
-  localStorage.setItem('mdwiki-theme', mode)
+  localStorage.setItem(THEME_KEY, mode)
   document.body.className = mode
-  document.getElementById('btn-theme').textContent = mode === 'dark' ? '🌙' : '☀️'
+  const btn = document.getElementById('btn-theme')
+  if (btn) btn.textContent = mode === 'dark' ? '🌙' : '☀️'
   if (view) view.dispatch({ effects: themeComp.reconfigure(themeExt[mode]) })
 }
-document.getElementById('btn-theme').onclick = () => applyTheme(themeMode === 'dark' ? 'light' : 'dark')
-import { markdown } from '@codemirror/lang-markdown'
-import * as Y from 'yjs'
-import { WebsocketProvider } from 'y-websocket'
-import { yCollab } from 'y-codemirror.next'
-import { marked } from 'marked'
-import DOMPurify from 'dompurify'
 
 // ---------- 用户身份:?u= 指定 > 标签页固定(sessionStorage,刷新不变) > 随机 ----------
 const COLORS = ['#e0533d', '#3d7fe0', '#3db86a', '#c47a1e', '#8e4fd1']
@@ -166,20 +180,21 @@ if (!uname) {
 const ucolor = COLORS[[...uname].reduce((a, c) => a + c.charCodeAt(0), 0) % COLORS.length]
 
 // ---------- DOM ----------
-const $fileList = document.getElementById('file-list')
-const $editor = document.getElementById('editor')
-const $preview = document.getElementById('preview')
-const $curFile = document.getElementById('cur-file')
-const $online = document.getElementById('online')
-const $btnNew = document.getElementById('btn-new')
-const $btnRev = document.getElementById('btn-revision')
-const $btnLog = document.getElementById('btn-log')
+const $fileList = document.getElementById('file-list') as HTMLElement
+const $editor = document.getElementById('editor') as HTMLElement
+const $preview = document.getElementById('preview') as HTMLElement
+const $curFile = document.getElementById('cur-file') as HTMLElement
+const $online = document.getElementById('online') as HTMLElement
+const $btnNew = document.getElementById('btn-new') as HTMLButtonElement
+const $btnRev = document.getElementById('btn-revision') as HTMLButtonElement
+const $btnLog = document.getElementById('btn-log') as HTMLButtonElement
+document.getElementById('btn-theme')!.addEventListener('click', () => applyTheme(themeMode === 'dark' ? 'light' : 'dark'))
 
 // ---------- 连接锁:断线(服务宕/网络差)期间禁止编辑,避免产生本地分叉 ----------
 const readonlyComp = new Compartment()
 const READONLY_EXT = [EditorState.readOnly.of(true), EditorView.editable.of(false)]
 let connLocked = true // 初始未连接,先锁
-function setConnLocked(locked) {
+function setConnLocked(locked: boolean): void {
   connLocked = locked
   const banner = document.getElementById('conn-banner')
   const col = document.getElementById('editor-col')
@@ -189,17 +204,18 @@ function setConnLocked(locked) {
 }
 
 // ---------- 编辑动作(HedgeDoc 风格工具栏,无上传能力) ----------
-const wrapSel = (b, a = b) => {
-  if (connLocked) return
+const wrapSel = (b: string, a: string = b): void => {
+  if (connLocked || !view) return
   const { from, to } = view.state.selection.main
   const sel = view.state.sliceDoc(from, to)
   view.dispatch({ changes: { from, to, insert: b + sel + a }, selection: { anchor: from + b.length, head: to + b.length } })
   view.focus()
 }
-const eachSelectedLine = (fn) => {
-  if (connLocked) return
+type ChangeSpec = { from: number; to?: number; insert: string }
+const eachSelectedLine = (fn: (line: { from: number; to: number; number: number; text: string }, changes: ChangeSpec[]) => void): void => {
+  if (connLocked || !view) return
   const { state } = view
-  const changes = []
+  const changes: ChangeSpec[] = []
   for (const range of state.selection.ranges) {
     const first = state.doc.lineAt(range.from), last = state.doc.lineAt(range.to)
     for (let n = first.number; n <= last.number; n++) fn(state.doc.line(n), changes)
@@ -207,10 +223,10 @@ const eachSelectedLine = (fn) => {
   view.dispatch({ changes })
   view.focus()
 }
-const linePrefix = (p) => eachSelectedLine((line, ch) =>
+const linePrefix = (p: string): void => eachSelectedLine((line, ch) =>
   line.text.startsWith(p) ? ch.push({ from: line.from, to: line.from + p.length, insert: '' })
                           : ch.push({ from: line.from, insert: p }))
-const setHeading = (lv) => {
+const setHeading = (lv: number): void => {
   const pref = '#'.repeat(lv) + ' '
   eachSelectedLine((line, ch) => {
     const m = line.text.match(/^#{1,6}\s+/)
@@ -218,17 +234,17 @@ const setHeading = (lv) => {
     ch.push({ from: line.from, to: line.to, insert: line.text.startsWith(pref) ? base : pref + base })
   })
 }
-const insertAtCursor = (text) => {
-  if (connLocked) return
+const insertAtCursor = (text: string): void => {
+  if (connLocked || !view) return
   const pos = view.state.selection.main.head
   view.dispatch({ changes: { from: pos, insert: text }, selection: { anchor: pos + text.length } })
   view.focus()
 }
-const insertCodeBlock = () => insertAtCursor('\n```\n\n```\n')
-const insertTable = () => insertAtCursor('\n| 列1 | 列2 | 列3 |\n|---|---|---|\n| 内容 | 内容 | 内容 |\n')
+const insertCodeBlock = (): void => insertAtCursor('\n```\n\n```\n')
+const insertTable = (): void => insertAtCursor('\n| 列1 | 列2 | 列3 |\n|---|---|---|\n| 内容 | 内容 | 内容 |\n')
 
 // ---------- Font Awesome 图标(内联 SVG,currentColor 随主题) ----------
-const ICONS = {
+const ICONS: Record<string, { vb: string; d: string }> = {
   'bold': { vb: '0 0 384 512', d: 'M32 32C14.3 32 0 46.3 0 64S14.3 96 32 96l32 0 0 320-32 0c-17.7 0-32 14.3-32 32s14.3 32 32 32l224 0c70.7 0 128-57.3 128-128 0-46.5-24.8-87.3-62-109.7 18.7-22.3 30-51 30-82.3 0-70.7-57.3-128-128-128L32 32zM288 160c0 35.3-28.7 64-64 64l-96 0 0-128 96 0c35.3 0 64 28.7 64 64zM128 416l0-128 128 0c35.3 0 64 28.7 64 64s-28.7 64-64 64l-128 0z' },
   'italic': { vb: '0 0 384 512', d: 'M128 64c0-17.7 14.3-32 32-32l192 0c17.7 0 32 14.3 32 32s-14.3 32-32 32l-58.7 0-133.3 320 64 0c17.7 0 32 14.3 32 32s-14.3 32-32 32L32 480c-17.7 0-32-14.3-32-32s14.3-32 32-32l58.7 0 133.3-320-64 0c-17.7 0-32-14.3-32-32z' },
   'strikethrough': { vb: '0 0 512 512', d: 'M96 157.5C96 88.2 152.2 32 221.5 32L368 32c17.7 0 32 14.3 32 32s-14.3 32-32 32L221.5 96c-34 0-61.5 27.5-61.5 61.5 0 31 23.1 57.2 53.9 61l44.1 5.5 222 0c17.7 0 32 14.3 32 32s-14.3 32-32 32L32 288c-17.7 0-32-14.3-32-32s14.3-32 32-32l83.1 0C103 204.6 96 181.8 96 157.5zM349.2 336l65.5 0c.9 6.1 1.4 12.2 1.4 18.5 0 69.3-56.2 125.5-125.5 125.5L144 480c-17.7 0-32-14.3-32-32s14.3-32 32-32l146.5 0c34 0 61.5-27.5 61.5-61.5 0-6.4-1-12.7-2.8-18.5z' },
@@ -254,13 +270,14 @@ const ICONS = {
   'file-lines': { vb: '0 0 384 512', d: 'M0 64C0 28.7 28.7 0 64 0L213.5 0c17 0 33.3 6.7 45.3 18.7L365.3 125.3c12 12 18.7 28.3 18.7 45.3L384 448c0 35.3-28.7 64-64 64L64 512c-35.3 0-64-28.7-64-64L0 64zm208-5.5l0 93.5c0 13.3 10.7 24 24 24L325.5 176 208 58.5zM120 256c-13.3 0-24 10.7-24 24s10.7 24 24 24l144 0c13.3 0 24-10.7 24-24s-10.7-24-24-24l-144 0zm0 96c-13.3 0-24 10.7-24 24s10.7 24 24 24l144 0c13.3 0 24-10.7 24-24s-10.7-24-24-24l-144 0z' },
 }
 
-const svgIcon = (name) => {
+const svgIcon = (name: string): string => {
   const i = ICONS[name]
   if (!i) return ''
   return `<svg viewBox="${i.vb}" width="13" height="13" fill="currentColor" aria-hidden="true"><path d="${i.d}"/></svg>`
 }
 
-const TOOLBAR = [
+interface ToolbarItem { icon?: string; lvl?: string; title?: string; act?: (this: HTMLButtonElement) => void; fmt?: boolean; sep?: number }
+const TOOLBAR: ToolbarItem[] = [
   { icon: 'bold', title: '粗体 ⌘B', act: () => wrapSel('**') },
   { icon: 'italic', title: '斜体 ⌘I', act: () => wrapSel('*') },
   { icon: 'strikethrough', title: '删除线', act: () => wrapSel('~~') },
@@ -274,21 +291,21 @@ const TOOLBAR = [
   { icon: 'list-ul', title: '无序列表', act: () => linePrefix('- ') },
   { icon: 'list-ol', title: '有序列表', act: () => linePrefix('1. ') },
   { sep: 1 },
-  { icon: 'link', title: '插入链接(笔记 / 外部 URL)', act: function () { openLinkMenu(this) } },
+  { icon: 'link', title: '插入链接(笔记 / 外部 URL)', act: function (this: HTMLButtonElement) { openLinkMenu(this) } },
   { icon: 'minus', title: '分隔线', act: () => insertAtCursor('\n\n---\n\n') },
   { icon: 'table', title: '表格', act: insertTable },
   { sep: 1 },
   { icon: 'wand-magic-sparkles', title: '格式化(json/yaml)', act: formatDoc, fmt: true },
 ]
 {
-  const bar = document.getElementById('toolbar')
+  const bar = document.getElementById('toolbar') as HTMLElement
   for (const b of TOOLBAR) {
     if (b.sep) { const s = document.createElement('span'); s.className = 'tb-sep tb-md'; bar.appendChild(s); continue }
     const btn = document.createElement('button')
     btn.title = b.title || ''
     btn.className = b.fmt ? 'tb-format' : 'tb-md'
-    btn.innerHTML = svgIcon(b.icon) + (b.lvl ? `<sup class="h-lvl">${b.lvl}</sup>` : '') + (b.fmt ? '<span class="tb-label">格式化</span>' : '')
-    btn.onclick = b.act
+    btn.innerHTML = svgIcon(b.icon || '') + (b.lvl ? `<sup class="h-lvl">${b.lvl}</sup>` : '') + (b.fmt ? '<span class="tb-label">格式化</span>' : '')
+    btn.onclick = b.act ? (() => b.act!.call(btn)) : null
     bar.appendChild(btn)
   }
   const status = document.createElement('span')
@@ -297,11 +314,51 @@ const TOOLBAR = [
 }
 
 // ---------- 笔记链接菜单(工具栏 🔗:笔记内链 + 外部 URL) ----------
-let filesCache = []
-let dirsCache = []   // 目录列表(移动目标选择器用)
+let filesCache: string[] = []
+let dirsCache: string[] = []   // 目录列表(移动目标选择器用)
 // 根目录的 .gitignore 是仓库配置:不可移动/改名/删除(子目录里的同名文件不受限)
-const isProtectedPath = (p) => p === '.gitignore'
-function openLinkMenu(anchorBtn) {
+const isProtectedPath = (p: string): boolean => p === '.gitignore'
+
+// ---------- 菜单工具:三处下拉菜单共用同一骨架(定位/外点关闭/条目) ----------
+let menuDocListener: ((e: MouseEvent) => void) | null = null
+// 关闭菜单时必须同时摘掉"点外部关闭"的 document 监听,否则监听器会永久累积:
+// 之后任何一次点击都会被旧菜单的监听器当成"点在外面",把新打开的菜单立刻关掉
+// (表现:从菜单里点「移动」→ 文件夹选择器一闪就没,2026-11-20 实测)
+function closeNoteMenu(): void {
+  document.getElementById('note-menu')?.remove()
+  if (menuDocListener) { document.removeEventListener('click', menuDocListener, true); menuDocListener = null }
+}
+interface MenuOpts { left: (rect: DOMRect) => number; build: (menu: HTMLElement) => void }
+function openMenu(anchor: HTMLElement, { left, build }: MenuOpts): HTMLElement {
+  closeNoteMenu()
+  const menu = document.createElement('div')
+  menu.id = 'note-menu'
+  build(menu)
+  const rect = anchor.getBoundingClientRect()
+  menu.style.left = left(rect) + 'px'
+  menu.style.top = (rect.bottom + 6) + 'px'
+  document.body.appendChild(menu)
+  // 捕获阶段判断,先于菜单项自己的 click:点条目时不会误关,点外部立即关闭
+  menuDocListener = (e: MouseEvent) => {
+    if (!menu.contains(e.target as Node) && e.target !== anchor) closeNoteMenu()
+  }
+  setTimeout(() => {
+    if (document.getElementById('note-menu') === menu && menuDocListener) document.addEventListener('click', menuDocListener, true)
+  }, 0)
+  return menu
+}
+interface MenuItemOpts { icon?: string; label: string; danger?: boolean; title?: string; onClick: () => void | Promise<void> }
+function menuItem(container: HTMLElement, { icon, label, danger, title, onClick }: MenuItemOpts): HTMLElement {
+  const el = document.createElement('div')
+  el.className = 'note-menu-item' + (danger ? ' menu-danger' : '')
+  el.innerHTML = (icon ? svgIcon(icon) + ' ' : '') + label
+  if (title) el.title = title
+  el.onclick = async () => { closeNoteMenu(); await onClick() }
+  container.appendChild(el)
+  return el
+}
+
+function openLinkMenu(anchorBtn: HTMLElement): void {
   const menu = openMenu(anchorBtn, {
     left: r => Math.max(8, r.left - 130),
     build: (menu) => {
@@ -309,7 +366,7 @@ function openLinkMenu(anchorBtn) {
       input.placeholder = '过滤笔记…'
       const list = document.createElement('div')
       list.className = 'note-menu-list'
-      const renderList = (q) => {
+      const renderList = (q: string): void => {
         const ql = q.toLowerCase()
         list.innerHTML = ''
         filesCache.filter(f => f.toLowerCase().includes(ql)).slice(0, 30).forEach(f => {
@@ -337,7 +394,7 @@ function openLinkMenu(anchorBtn) {
       extBtn.style.cssText = 'background:var(--btn);color:var(--fg);border:1px solid var(--border2);border-radius:5px;padding:3px 10px;cursor:pointer;font-size:12px'
       extBtn.onclick = () => {
         const url = extInput.value.trim()
-        if (!url) return
+        if (!url || !view) return
         const { from, to } = view.state.selection.main
         const text = view.state.sliceDoc(from, to) || url
         view.dispatch({ changes: { from, to, insert: `[${text}](${url})` } })
@@ -350,50 +407,15 @@ function openLinkMenu(anchorBtn) {
   })
   const [input, extInput] = menu.querySelectorAll('input')
   input.focus()
-  input.onkeydown = extInput.onkeydown = (e) => { if (e.key === 'Escape') closeNoteMenu() }
-}
-// 关闭菜单时必须同时摘掉"点外部关闭"的 document 监听,否则监听器会永久累积:
-// 之后任何一次点击都会被旧菜单的监听器当成"点在外面",把新打开的菜单立刻关掉
-// (表现:从菜单里点「移动」→ 文件夹选择器一闪就没,2026-11-20 实测)
-let menuDocListener = null
-function closeNoteMenu() {
-  document.getElementById('note-menu')?.remove()
-  if (menuDocListener) { document.removeEventListener('click', menuDocListener, true); menuDocListener = null }
-}
-
-// ---------- 菜单工具:三处下拉菜单共用同一骨架(定位/外点关闭/条目) ----------
-function openMenu(anchor, { left, build }) {
-  closeNoteMenu()
-  const menu = document.createElement('div')
-  menu.id = 'note-menu'
-  build(menu)
-  const rect = anchor.getBoundingClientRect()
-  menu.style.left = left(rect) + 'px'
-  menu.style.top = (rect.bottom + 6) + 'px'
-  document.body.appendChild(menu)
-  // 捕获阶段判断,先于菜单项自己的 click:点条目时不会误关,点外部立即关闭
-  menuDocListener = (e) => {
-    if (!menu.contains(e.target) && e.target !== anchor) closeNoteMenu()
-  }
-  setTimeout(() => {
-    if (document.getElementById('note-menu') === menu) document.addEventListener('click', menuDocListener, true)
-  }, 0)
-  return menu
-}
-function menuItem(container, { icon, label, danger, title, onClick }) {
-  const el = document.createElement('div')
-  el.className = 'note-menu-item' + (danger ? ' menu-danger' : '')
-  el.innerHTML = (icon ? svgIcon(icon) + ' ' : '') + label
-  if (title) el.title = title
-  el.onclick = async () => { closeNoteMenu(); await onClick() }
-  container.appendChild(el)
-  return el
+  const onKey = (e: KeyboardEvent): void => { if (e.key === 'Escape') closeNoteMenu() }
+  input.onkeydown = onKey
+  extInput.onkeydown = onKey
 }
 
 // 服务端重启(世代变更):本地历史已作废 → 直接丢弃并重载,拉取服务端最新内容
 // 不生成任何"恢复副本"文件(避免用户困惑);静默窗口内的少量未同步编辑按设计放弃
 let epochHandling = false
-function handleEpochMismatch() {
+function handleEpochMismatch(): void {
   if (epochHandling) return
   epochHandling = true
   const b = document.getElementById('conn-banner')
@@ -405,16 +427,18 @@ function handleEpochMismatch() {
 }
 
 // ---------- 状态 ----------
-let view = null, provider = null, scrollAbort = null
-const currentFile = () => decodeURIComponent(location.hash.slice(1)) || '欢迎.md'
+let view: EditorView | null = null
+let provider: WebsocketProvider | null = null
+let scrollAbort: AbortController | null = null
+const currentFile = (): string => decodeURIComponent(location.hash.slice(1)) || '欢迎.md'
 
 // ---------- 文件列表(目录树) + 拖拽 ----------
-const closedDirs = new Set() // 默认全部展开,点过的收起
-const selection = new Set()  // 多选:完整路径集合
-let dragItems = []           // 本次拖拽的源(单选或框选)
+const closedDirs = new Set<string>() // 默认全部展开,点过的收起
+const selection = new Set<string>()  // 多选:完整路径集合
+let dragItems: DragItem[] = []       // 本次拖拽的源(单选或框选)
 
 // 拖拽入口:写在 render 循环外,由各 row 触发
-function setupDrag(rowEl, path, isDir) {
+function setupDrag(rowEl: HTMLElement, path: string, isDir: boolean): void {
   if (isProtectedPath(path)) { rowEl.draggable = false; return }  // 受保护文件不可拖走
   rowEl.draggable = true
   rowEl.addEventListener('dragstart', (e) => {
@@ -424,8 +448,8 @@ function setupDrag(rowEl, path, isDir) {
       from: p,
       isDir: !filesCache.includes(p), // 不在文件列表 → 目录
     }))
-    e.dataTransfer.setData('text/plain', JSON.stringify(dragItems))
-    e.dataTransfer.effectAllowed = 'move'
+    e.dataTransfer?.setData('text/plain', JSON.stringify(dragItems))
+    if (e.dataTransfer) e.dataTransfer.effectAllowed = 'move'
     rowEl.classList.add('dragging')
   })
   rowEl.addEventListener('dragend', () => { rowEl.classList.remove('dragging'); clearDropHint() })
@@ -435,7 +459,7 @@ function setupDrag(rowEl, path, isDir) {
 // 注意:根区域是常驻元素,必须"只绑一次",否则每次 refreshFiles 都会叠加一层 drop 监听
 // → 一次拖放触发 N 次移动,后 N-1 次报「不存在」并弹窗(2026-11-20 实测事故)
 let rootZoneBound = false
-function setupDropZone(el, targetDir) {
+function setupDropZone(el: HTMLElement, targetDir: string): void {
   if (el === $fileList) {
     if (rootZoneBound) return
     rootZoneBound = true
@@ -443,7 +467,7 @@ function setupDropZone(el, targetDir) {
   el.addEventListener('dragover', (e) => {
     e.preventDefault()
     e.stopPropagation() // 防止父容器也高亮
-    e.dataTransfer.dropEffect = 'move'
+    if (e.dataTransfer) e.dataTransfer.dropEffect = 'move'
     el.classList.add('drop-target')
   })
   el.addEventListener('dragleave', () => el.classList.remove('drop-target'))
@@ -453,9 +477,9 @@ function setupDropZone(el, targetDir) {
     el.classList.remove('drop-target')
     // 优先用模块级 dragItems(dragstart 时设置,保证多选完整);
     // dataTransfer.getData 在某些浏览器/场景下可能返回空或不完整
-    let items = (dragItems && dragItems.length > 0) ? dragItems : []
+    let items: DragItem[] = (dragItems && dragItems.length > 0) ? dragItems : []
     if (!items.length) {
-      try { items = JSON.parse(e.dataTransfer.getData('text/plain')) || [] } catch {}
+      try { items = (JSON.parse(e.dataTransfer?.getData('text/plain') || '[]') as DragItem[]) || [] } catch { /* 忽略非法载荷 */ }
     }
     if (!items.length) return
     const dest = targetDir === '' ? '' : targetDir
@@ -465,7 +489,7 @@ function setupDropZone(el, targetDir) {
     const r = await (await fetch('/api/move-batch', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ items, to: dest }),
-    })).json()
+    })).json() as MoveBatchResp
     if (!r.ok) toast(r.results?.find(x => !x.ok)?.error || '移动失败', 'err')
     selection.clear()
     refreshFiles()
@@ -476,13 +500,16 @@ function setupDropZone(el, targetDir) {
   })
 }
 
-function clearDropHint() { document.querySelectorAll('.drop-target').forEach(el => el.classList.remove('drop-target')) }
+function clearDropHint(): void { document.querySelectorAll('.drop-target').forEach(el => el.classList.remove('drop-target')) }
 // 全局兜底:任何拖拽结束都清掉残留高亮(只注册一次)
 document.addEventListener('dragend', () => { document.querySelectorAll('.dragging').forEach(el => el.classList.remove('dragging')); clearDropHint() })
 
 // 轻提示:替代 alert(模态框会打断操作,且拖拽场景下会连环弹)
-let toastEl = null, toastTimer = null, lastToast = { msg: '', at: 0 }
-function toast(msg, kind = 'ok') {
+type ToastKind = 'ok' | 'err' | 'info'
+let toastEl: HTMLElement | null = null
+let toastTimer: ReturnType<typeof setTimeout> | null = null
+let lastToast = { msg: '', at: 0 }
+function toast(msg: string, kind: ToastKind = 'ok'): void {
   const now = Date.now()
   if (msg === lastToast.msg && now - lastToast.at < 800) return   // 相同消息去重
   lastToast = { msg, at: now }
@@ -493,25 +520,25 @@ function toast(msg, kind = 'ok') {
   }
   toastEl.textContent = msg
   toastEl.className = 'show ' + kind
-  clearTimeout(toastTimer)
-  toastTimer = setTimeout(() => { toastEl.className = '' }, 2600)
+  if (toastTimer) clearTimeout(toastTimer)
+  toastTimer = setTimeout(() => { if (toastEl) toastEl.className = '' }, 2600)
 }
-function renderSelection() {
-  document.querySelectorAll('#sidebar .tree-row').forEach(row => {
-    row.classList.toggle('selected', selection.has(row.dataset.path))
+function renderSelection(): void {
+  document.querySelectorAll<HTMLElement>('#sidebar .tree-row').forEach(row => {
+    row.classList.toggle('selected', selection.has(row.dataset.path || ''))
   })
 }
-async function refreshFiles() {
-  const r = await (await fetch('/api/files')).json()
+async function refreshFiles(): Promise<void> {
+  const r = await (await fetch('/api/files')).json() as FilesResp
   filesCache = r.files || []
   dirsCache = r.dirs || []
-  const root = {}
+  const root: TreeNode = {}
   for (const d of r.dirs || []) { // 空目录也要出现在树上:每一段都建节点并记录完整路径
     let node = root
     let acc = ''
     for (const p of d.split('/')) {
       acc = acc ? acc + '/' + p : p
-      node = (node[p] ??= {})
+      node = (node[p] as TreeNode) ?? (node[p] = {} as TreeNode)
       node.__path = acc
     }
   }
@@ -520,20 +547,21 @@ async function refreshFiles() {
     let node = root
     parts.forEach((p, i) => {
       if (i === parts.length - 1) (node.__files ??= []).push({ name: p, full: f })
-      else { node = (node[p] ??= {}); node.__path ??= p }
+      else { node = (node[p] as TreeNode) ?? (node[p] = {} as TreeNode); node.__path ??= p }
     })
   }
-  const render = (node, depth) => {
+  const render = (node: TreeNode, depth: number): DocumentFragment => {
     const frag = document.createDocumentFragment()
     for (const [k, child] of Object.entries(node).filter(([k]) => k !== '__files' && k !== '__hasDir' && k !== '__path')) {
+      const kid = child as TreeNode
       const open = !closedDirs.has(k)
       const d = document.createElement('div')
       d.className = 'dir tree-row'
-      d.dataset.path = child.__path || k
+      d.dataset.path = kid.__path || k
       d.style.paddingLeft = (10 + depth * 13) + 'px'
       const label = document.createElement('span')
       label.className = 'tree-label'
-      const hasKids = Object.keys(child).some(x => !x.startsWith('__')) || (child.__files?.length > 0)
+      const hasKids = Object.keys(kid).some(x => !x.startsWith('__')) || ((kid.__files?.length ?? 0) > 0)
       label.innerHTML = (hasKids ? `<span class="chev">${open ? '▾' : '▸'}</span>` : '<span class="chev-placeholder"></span>')
         + svgIcon(open ? 'folder-open' : 'folder') + ' ' + k
       d.appendChild(label)
@@ -541,11 +569,11 @@ async function refreshFiles() {
       mv.className = 'row-menu-btn'
       mv.title = '操作'
       mv.innerHTML = svgIcon('ellipsis')
-      mv.onclick = (e) => { e.stopPropagation(); openRowMenu(mv, child.__path || k, true) }
+      mv.onclick = (e) => { e.stopPropagation(); openRowMenu(mv, kid.__path || k, true) }
       d.appendChild(mv)
       d.onclick = (e) => {
         if (e.metaKey || e.ctrlKey || e.shiftKey) { // 多选(目录也可拖)
-          selection.has(d.dataset.path) ? selection.delete(d.dataset.path) : selection.add(d.dataset.path)
+          selection.has(d.dataset.path!) ? selection.delete(d.dataset.path!) : selection.add(d.dataset.path!)
           renderSelection(); return
         }
         closedDirs.has(k) ? closedDirs.delete(k) : closedDirs.add(k); refreshFiles()
@@ -553,7 +581,7 @@ async function refreshFiles() {
       setupDrag(d, d.dataset.path, true)
       setupDropZone(d, d.dataset.path) // 目录行 = 放置目标(移入该目录)
       frag.appendChild(d)
-      if (open) frag.appendChild(render(child, depth + 1))
+      if (open) frag.appendChild(render(kid, depth + 1))
     }
     for (const f of node.__files ?? []) {
       const row = document.createElement('div')
@@ -564,6 +592,9 @@ async function refreshFiles() {
       a.href = '#' + encodeURIComponent(f.full)
       const extCls = 'f-' + (f.full.match(/\.([a-z0-9]+)$/i)?.[1] || 'md').toLowerCase()
       a.innerHTML = svgIcon('file-lines') + '<span class="' + extCls + '">' + f.name + '</span>'
+      // 注:不在 mousedown 上 preventDefault(会阻止原生 HTML5 拖拽启动!)
+      // 文字选中干扰已用 CSS user-select:none 解决
+      if (f.full === currentFile()) row.classList.add('active')
       a.onclick = (e) => {
         if (e.metaKey || e.ctrlKey || e.shiftKey) { e.preventDefault(); return }
         setTimeout(refreshFiles, 0)
@@ -571,10 +602,6 @@ async function refreshFiles() {
       row.onclick = (e) => {
         if (e.metaKey || e.ctrlKey || e.shiftKey) { e.preventDefault(); selection.has(f.full) ? selection.delete(f.full) : selection.add(f.full); renderSelection() }
       }
-      // 注:不在这里 preventDefault(mousedown 的 preventDefault 会阻止原生 HTML5 拖拽启动!)
-      // 文字选中干扰已用 CSS user-select:none 解决
-      if (f.full === currentFile()) row.classList.add('active')
-      a.onclick = () => setTimeout(refreshFiles, 0)
       const mv = document.createElement('button')
       mv.className = 'row-menu-btn'
       mv.title = '操作'
@@ -582,7 +609,7 @@ async function refreshFiles() {
       mv.onclick = (e) => { e.preventDefault(); e.stopPropagation(); openRowMenu(mv, f.full, false) }
       setupDrag(row, f.full, false)
       // 文件行不是放置目标:拦住冒泡,否则会被根区域当成"移到根"(且旧代码会连环弹「不存在」)
-      row.addEventListener('dragover', (e) => { e.preventDefault(); e.stopPropagation(); e.dataTransfer.dropEffect = 'none' })
+      row.addEventListener('dragover', (e) => { e.preventDefault(); e.stopPropagation(); if (e.dataTransfer) e.dataTransfer.dropEffect = 'none' })
       row.addEventListener('drop', (e) => { e.preventDefault(); e.stopPropagation() })
       row.appendChild(a)
       row.appendChild(mv)
@@ -597,16 +624,16 @@ async function refreshFiles() {
 }
 
 // ---------- 打开文件:重建 Yjs 房间 ----------
-async function resolvePath(file) {
+async function resolvePath(file: string): Promise<ResolveResp> {
   try {
-    return await (await fetch('/api/resolve?path=' + encodeURIComponent(file))).json()
+    return await (await fetch('/api/resolve?path=' + encodeURIComponent(file))).json() as ResolveResp
   } catch { return { status: 'offline' } }
 }
-async function openFile() {
+async function openFile(): Promise<void> {
   const file = currentFile()
   // 路径可能已被移动/删除:先解析,该跳转跳转
   const res = await resolvePath(file)
-  if (res.status === 'moved') { location.hash = '#' + encodeURIComponent(res.to); return }
+  if (res.status === 'moved' && res.to) { location.hash = '#' + encodeURIComponent(res.to); return }
   if (res.status === 'gone') {
     const fallback = filesCache.find(f => f.endsWith('.md')) || filesCache[0]
     // 无 hash 的隐式默认文件缺失:静默换第一个文件;显式打开的文件没了才提示
@@ -622,48 +649,49 @@ async function openFile() {
 
   const ydoc = await createCollab(file)
   mountEditor(file, ydoc)
-  bindPresence(provider)
+  bindPresence(provider!)
   bindScrollSync()
   bindPreview(file, ydoc)
 }
 
 // 按文件类型切换工具栏与预览窗格(md 工具 / 仅格式化 / 全收起)
-function applyFileUi(file) {
+function applyFileUi(file: string): void {
   const ext = extOf(file)
   const isFmt = ext === 'json' || ext === 'yaml' || ext === 'yml'
   $preview.style.display = ext === 'md' ? '' : 'none'
-  document.getElementById('toolbar').style.display = (ext === 'md' || isFmt) ? '' : 'none'
-  document.querySelectorAll('#toolbar .tb-md').forEach(el => el.style.display = ext === 'md' ? '' : 'none')
-  const fmtBtn = document.querySelector('#toolbar .tb-format')
+  const toolbar = document.getElementById('toolbar') as HTMLElement
+  toolbar.style.display = (ext === 'md' || isFmt) ? '' : 'none'
+  document.querySelectorAll<HTMLElement>('#toolbar .tb-md').forEach(el => { el.style.display = ext === 'md' ? '' : 'none' })
+  const fmtBtn = document.querySelector<HTMLElement>('#toolbar .tb-format')
   if (fmtBtn) fmtBtn.style.display = isFmt ? '' : 'none'
 }
 
 // 销毁上一次的编辑器 / 连接 / 滚动监听
-function teardownEditor() {
+function teardownEditor(): void {
   if (view) { view.destroy(); view = null }
   if (provider) { provider.destroy(); provider = null }
   if (scrollAbort) { scrollAbort.abort(); scrollAbort = null }
 }
 
 // 建立协作连接:世代号握手 + 连接锁 + 关闭码处理(4001 重启 / 4002 删除 / 普通断线)
-async function createCollab(file) {
+async function createCollab(file: string): Promise<Y.Doc> {
   const ydoc = new Y.Doc()
   let epoch = ''
-  try { epoch = (await (await fetch('/api/epoch')).json()).epoch || '' } catch {}
+  try { epoch = ((await (await fetch('/api/epoch')).json()) as { epoch?: string }).epoch || '' } catch { /* 拿不到 epoch 就按无世代连接 */ }
   provider = new WebsocketProvider(`ws://${location.host}/ws`, encodeURIComponent(file) + (epoch ? '?epoch=' + epoch : ''), ydoc)
   provider.awareness.setLocalStateField('user', { name: uname, color: ucolor })
-  const onStatus = ({ status }) => setConnLocked(status !== 'connected')
-  provider.on('status', onStatus)
+  const onStatus = ({ status }: { status: string }): void => setConnLocked(status !== 'connected')
+  provider.on('status', onStatus as never)
   provider.on('sync', () => setConnLocked(false))
   onStatus({ status: provider.wsconnected ? 'connected' : 'connecting' })
-  provider.on('connection-close', (ev) => {
+  provider.on('connection-close', (ev: { code?: number } | null) => {
     if (ev && ev.code === 4001) { handleEpochMismatch(); return }   // 服务重启过:丢弃本地状态重载
     if (ev && ev.code === 4002) { setTimeout(() => location.reload(), 300); return } // 文件被删:重载回首页
     // 普通断线:6 秒仍连不上则查路径状态(文件可能被移动/删除)
     setTimeout(async () => {
-      if (!provider.wsconnected) {
+      if (provider && !provider.wsconnected) {
         const r = await resolvePath(file)
-        if (r.status === 'moved') location.hash = '#' + encodeURIComponent(r.to)
+        if (r.status === 'moved' && r.to) location.hash = '#' + encodeURIComponent(r.to)
         else if (r.status === 'gone') { toast('此文件已被删除:' + file, 'err'); location.hash = '#' + encodeURIComponent('欢迎.md') }
       }
     }, 6000)
@@ -672,11 +700,11 @@ async function createCollab(file) {
 }
 
 // 挂载 CodeMirror:主题 / 语言 / 只读舱(连接锁) / 快捷键 / 协作绑定
-function mountEditor(file, ydoc) {
+function mountEditor(file: string, ydoc: Y.Doc): void {
   const ytext = ydoc.getText('codemirror')
   // 不依赖焦点的光标广播:插件只在编辑器聚焦时上报,导致失焦窗口的光标永远不可见
-  const sendCursor = () => {
-    if (!view) return
+  const sendCursor = (): void => {
+    if (!view || !provider) return
     const sel = view.state.selection.main
     provider.awareness.setLocalStateField('cursor', {
       anchor: Y.createRelativePositionFromTypeIndex(ytext, sel.anchor),
@@ -689,20 +717,21 @@ function mountEditor(file, ydoc) {
       keymap.of([
         { key: 'Mod-b', preventDefault: true, run: () => (wrapSel('**'), true) },
         { key: 'Mod-i', preventDefault: true, run: () => (wrapSel('*'), true) },
-        { key: 'Mod-s', preventDefault: true, run: () => (saveRevision(), true) },
+        { key: 'Mod-s', preventDefault: true, run: () => { void saveRevision(); return true } },
       ]),
       EditorView.updateListener.of(u => { if (u.selectionSet || u.docChanged) sendCursor() }),
-      yCollab(ytext, provider.awareness)],
+      yCollab(ytext, provider!.awareness)],
     parent: $editor,
   })
   setTimeout(sendCursor, 400) // 初始光标(即使窗口未聚焦)
 }
 
 // 在线用户徽标
-function bindPresence(prov) {
-  const renderOnline = () => {
-    const users = [...prov.awareness.getStates().values()].map(s => s.user).filter(Boolean)
-    const seen = new Map()
+interface PresenceUser { name: string; color: string }
+function bindPresence(prov: WebsocketProvider): void {
+  const renderOnline = (): void => {
+    const users = [...prov.awareness.getStates().values()].map(s => s.user as PresenceUser | undefined).filter(Boolean) as PresenceUser[]
+    const seen = new Map<string, string>()
     users.forEach(u => seen.set(u.name, u.color))
     $online.innerHTML = [...seen].map(([n, c]) =>
       `<span class="badge" style="border-color:${c};color:${c}">${n}</span>`).join(' ')
@@ -712,12 +741,13 @@ function bindPresence(prov) {
 }
 
 // 双栏滚动同步:双向比例同步;时间戳防抖切断反馈环(不依赖 rAF,后台页不被节流卡死)
-function bindScrollSync() {
+function bindScrollSync(): void {
   if (scrollAbort) scrollAbort.abort()
   scrollAbort = new AbortController()
   const { signal } = scrollAbort
+  if (!view) return
   let lastSync = 0
-  const link = (src, dst) => () => {
+  const link = (src: HTMLElement, dst: HTMLElement) => () => {
     const now = Date.now()
     if (now - lastSync < 80) return // 我刚被程序同步过,这是回声,忽略
     lastSync = now
@@ -732,28 +762,29 @@ function bindScrollSync() {
 }
 
 // 预览渲染:markdown 排版 + [TOC] + 代码高亮;非 md 不渲染
-function bindPreview(file, ydoc) {
+interface MdToken { type?: string; depth?: number; text?: string; tokens?: MdToken[] }
+function bindPreview(file: string, ydoc: Y.Doc): void {
   const ytext = ydoc.getText('codemirror')
-  let timer
-  const buildToc = (md) => {
-    const out = []
-    const walk = toks => toks.forEach(t => {
-      if (t.type === 'heading') out.push('  '.repeat(Math.max(0, t.depth - 1)) + `- ${t.text}`)
+  let timer: ReturnType<typeof setTimeout> | null = null
+  const buildToc = (md: string): string => {
+    const out: string[] = []
+    const walk = (toks: MdToken[]): void => toks.forEach(t => {
+      if (t.type === 'heading') out.push('  '.repeat(Math.max(0, (t.depth || 1) - 1)) + `- ${t.text}`)
       if (t.tokens) walk(t.tokens)
     })
-    walk(marked.lexer(md))
+    walk(marked.lexer(md) as MdToken[])
     return out.join('\n') || '*(无标题,无法生成目录)*'
   }
-  const render = () => {
+  const render = (): void => {
     if (extOf(file) !== 'md') return
     let md = ytext.toString()
     if (/^\[TOC\]$/m.test(md)) md = md.replace(/^\[TOC\]$/gm, buildToc(md))
-    $preview.innerHTML = DOMPurify.sanitize(marked.parse(md, { gfm: true, breaks: true }))
+    $preview.innerHTML = DOMPurify.sanitize(marked.parse(md, { gfm: true, breaks: true }) as string)
     highlightPreview()
     // 站外链接新窗口打开
-    document.querySelectorAll('#preview a[href^="http"]').forEach(a => { a.target = '_blank'; a.rel = 'noopener' })
+    document.querySelectorAll<HTMLAnchorElement>('#preview a[href^="http"]').forEach(a => { a.target = '_blank'; a.rel = 'noopener' })
   }
-  ydoc.on('update', () => { clearTimeout(timer); timer = setTimeout(render, 200) })
+  ydoc.on('update', () => { if (timer) clearTimeout(timer); timer = setTimeout(render, 200) })
   render()
 }
 
@@ -768,9 +799,9 @@ $btnNew.onclick = () => {
         const r = await (await fetch('/api/files', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ name }),
-        })).json()
-        if (r.ok) { location.hash = '#' + encodeURIComponent(r.name); refreshFiles(); openFile() }
-        else toast(r.error, 'err')
+        })).json() as SimpleResp & { name?: string }
+        if (r.ok && r.name) { location.hash = '#' + encodeURIComponent(r.name); refreshFiles(); openFile() }
+        else toast(r.error || '创建失败', 'err')
       } })
       menuItem(menu, { icon: 'folder-plus', label: '新目录', onClick: async () => {
         const p = prompt('目录路径(可嵌套,如 架构/网关):')
@@ -778,8 +809,8 @@ $btnNew.onclick = () => {
         const r = await (await fetch('/api/mkdir', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ path: p }),
-        })).json()
-        if (r.ok) refreshFiles(); else toast(r.error, 'err')
+        })).json() as SimpleResp
+        if (r.ok) refreshFiles(); else toast(r.error || '创建失败', 'err')
       } })
     },
   })
@@ -787,31 +818,32 @@ $btnNew.onclick = () => {
 
 // 移动核心(from→to),成功后当前文件跟随跳转
 // into=true 表示 to 是"目标文件夹"('' = 根目录);否则 to 是最终完整路径(重命名用)
-async function moveTo(from, to, isDir, into = false) {
+async function moveTo(from: string, to: string, isDir: boolean, into = false): Promise<boolean> {
   const r = await (await fetch('/api/move', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ from, to, into }),
-  })).json()
-  if (!r.ok) { toast(r.error, 'err'); return false }
+  })).json() as SimpleResp & { to?: string }
+  if (!r.ok) { toast(r.error || '移动失败', 'err'); return false }
   refreshFiles()
   const cur = currentFile()
   if (isDir ? (cur === from || cur.startsWith(from + '/')) : cur === from) {
-    location.hash = '#' + encodeURIComponent(isDir ? r.to + cur.slice(from.length) : r.to)
+    const target = r.to as string
+    location.hash = '#' + encodeURIComponent(isDir ? target + cur.slice(from.length) : target)
     openFile()
   }
   return true
 }
 
 // 「移动」= 选一个文件夹(目标只能是文件夹,不接受手输路径)
-function moveItem(anchorBtn, from, isDir) {
-  const parentOf = (p) => p.split('/').slice(0, -1).join('')
+function moveItem(anchorBtn: HTMLElement, from: string, isDir: boolean): void {
+  const parentOf = (p: string): string => p.split('/').slice(0, -1).join('')
   const curParent = parentOf(from)
   openedFolderPicker(anchorBtn, { from, isDir, curParent })
 }
 
-function openedFolderPicker(anchorBtn, { from, isDir, curParent }) {
+function openedFolderPicker(anchorBtn: HTMLElement, { from, isDir, curParent }: { from: string; isDir: boolean; curParent: string }): void {
   // 目录本身及其子目录不能作为目标(移入自身会破坏树形结构)
-  const blocked = (d) => isDir && (d === from || d.startsWith(from + '/'))
+  const blocked = (d: string): boolean => isDir && (d === from || d.startsWith(from + '/'))
   openMenu(anchorBtn, {
     left: r => Math.min(window.innerWidth - 250, Math.max(8, r.left - 150)),
     build: (menu) => {
@@ -824,7 +856,7 @@ function openedFolderPicker(anchorBtn, { from, isDir, curParent }) {
       input.placeholder = '过滤文件夹…'
       const list = document.createElement('div')
       list.className = 'note-menu-list'
-      const renderList = (q) => {
+      const renderList = (q: string): void => {
         const ql = q.trim().toLowerCase()
         list.innerHTML = ''
         const all = [''].concat(dirsCache.filter(d => !blocked(d)))
@@ -837,7 +869,7 @@ function openedFolderPicker(anchorBtn, { from, isDir, curParent }) {
           const isCur = d === curParent
           const el = menuItem(list, {
             icon: d === '' ? 'folder-open' : 'folder',
-            label: d === '' ? '根目录(顶层)' : d.split('/').pop(),
+            label: d === '' ? '根目录(顶层)' : (d.split('/').pop() as string),
             title: isCur ? '就是当前所在位置' : d || '根目录',
             onClick: () => { if (!isCur) moveTo(from, d, isDir, true) },
           })
@@ -853,8 +885,8 @@ function openedFolderPicker(anchorBtn, { from, isDir, curParent }) {
     },
   })
 }
-async function renameItem(path, isDir) {
-  const oldName = path.split('/').pop()
+async function renameItem(path: string, isDir: boolean): Promise<void> {
+  const oldName = path.split('/').pop() as string
   const newName = prompt('重命名(只改名字,目录不变):', isDir ? oldName : oldName.replace(/\.[^.]+$/, ''))
   if (!newName || newName === oldName) return
   const parent = path.split('/').slice(0, -1).join('/')
@@ -862,27 +894,27 @@ async function renameItem(path, isDir) {
   if (!isDir && !/\.[a-z0-9]+$/i.test(newName)) target += '.' + (path.match(/\.([^.]+)$/)?.[1] || 'md') // 没写后缀则保留原后缀
   await moveTo(path, parent ? parent + '/' + target : target, isDir)
 }
-async function deleteItem(path, isDir) {
+async function deleteItem(path: string, isDir: boolean): Promise<void> {
   if (!confirm(`确定删除 ${path} ?` + (isDir ? '\n目录将递归删除!' : ''))) return
   const r = await (await fetch('/api/delete', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ path }),
-  })).json()
-  if (!r.ok) { toast(r.error, 'err'); return }
+  })).json() as SimpleResp
+  if (!r.ok) { toast(r.error || '删除失败', 'err'); return }
   const cur = currentFile()
   if (cur === path || cur.startsWith(path + '/')) { location.hash = '#' + encodeURIComponent('欢迎.md'); openFile() }
   refreshFiles()
 }
 // 行操作菜单:移动 / 重命名 / 删除
-function openRowMenu(anchorBtn, path, isDir) {
+function openRowMenu(anchorBtn: HTMLElement, path: string, isDir: boolean): void {
   const locked = isProtectedPath(path)   // 根目录 .gitignore:仓库配置,禁止移动/改名/删除
-  const guard = (fn) => () => { if (locked) { toast('根目录 .gitignore 是仓库配置,不能修改', 'err'); return } fn() }
+  const guard = (fn: () => void): (() => void) => () => { if (locked) { toast('根目录 .gitignore 是仓库配置,不能修改', 'err'); return } fn() }
   openMenu(anchorBtn, {
     left: r => Math.min(window.innerWidth - 200, Math.max(8, r.left - 150)),
     build: (menu) => {
       menuItem(menu, { icon: 'right-left', label: '移动', onClick: guard(() => moveItem(anchorBtn, path, isDir)) })
-      menuItem(menu, { icon: 'pen-to-square', label: '重命名', onClick: guard(() => renameItem(path, isDir)) })
-      menuItem(menu, { icon: 'trash-can', label: '删除', danger: true, onClick: guard(() => deleteItem(path, isDir)) })
+      menuItem(menu, { icon: 'pen-to-square', label: '重命名', onClick: guard(() => { void renameItem(path, isDir) }) })
+      menuItem(menu, { icon: 'trash-can', label: '删除', danger: true, onClick: guard(() => { void deleteItem(path, isDir) }) })
       if (locked) {
         const note = document.createElement('div')
         note.className = 'note-menu-empty'
@@ -894,31 +926,31 @@ function openRowMenu(anchorBtn, path, isDir) {
 }
 
 // 手动保存:立即落盘(不 commit);按钮短暂反馈
-async function saveToDisk() {
-  const btn = document.getElementById('btn-save')
+async function saveToDisk(): Promise<void> {
+  const btn = document.getElementById('btn-save') as HTMLButtonElement
   const orig = btn.textContent
   try {
-    const r = await (await fetch('/api/flush', { method: 'POST' })).json()
+    const r = await (await fetch('/api/flush', { method: 'POST' })).json() as { ok: boolean; flushed: number }
     btn.textContent = r.ok ? (r.flushed > 0 ? `✓ 已保存 ${r.flushed} 篇` : '✓ 已是最新') : '✗ 失败'
   } catch { btn.textContent = '✗ 失败' }
   setTimeout(() => { btn.textContent = orig }, 1500)
 }
-document.getElementById('btn-save').onclick = saveToDisk
+;(document.getElementById('btn-save') as HTMLButtonElement).onclick = saveToDisk
 
-async function saveRevision() {
+async function saveRevision(): Promise<boolean> {
   const msg = prompt('版本说明(可留空):', '')
   if (msg === null) return false
   const r = await (await fetch('/api/revision', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ message: msg }),
-  })).json()
+  })).json() as SimpleResp & { commit?: string; message?: string }
   alert(r.ok ? `已提交版本 ${r.commit}\n${r.message}` : r.error)
   return !!r.ok
 }
-$btnRev.onclick = saveRevision
+$btnRev.onclick = () => { void saveRevision() }
 
 $btnLog.onclick = async () => {
-  const r = await (await fetch('/api/log?file=' + encodeURIComponent(currentFile()))).json()
+  const r = await (await fetch('/api/log?file=' + encodeURIComponent(currentFile()))).json() as { entries: { h: string; t: string; s: string }[] }
   if (!r.entries.length) { alert('此文件还没有版本'); return }
   const text = r.entries.map(e => `${e.h}  ${e.t}  ${e.s}`).join('\n')
   const commit = prompt(`历史版本(点取消关闭):\n${text}\n\n要恢复到哪条?粘贴 commit 短哈希:`)
@@ -926,7 +958,7 @@ $btnLog.onclick = async () => {
   const res = await (await fetch('/api/restore', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ file: currentFile(), commit: commit.trim() }),
-  })).json()
+  })).json() as SimpleResp & { chars?: number }
   alert(res.ok ? `已恢复 (${res.chars} 字符),稍后自动写回文件(可点💾保存立即落盘)` : res.error)
 }
 
@@ -952,7 +984,7 @@ $btnLog.onclick = async () => {
       const startPW = preview.getBoundingClientRect().width
       const total = startEW + startPW
       const MIN_E = 150, MIN_P = 100   // 两侧最小宽度:拖到头就停住,任何一侧都不会被挤没
-      const onMove = (ev) => {
+      const onMove = (ev: MouseEvent): void => {
         let eW = startEW + (ev.clientX - startX)
         eW = Math.min(Math.max(eW, MIN_E), Math.max(MIN_E, total - MIN_P))
         const pW = total - eW
@@ -960,7 +992,7 @@ $btnLog.onclick = async () => {
         editorCol.style.flex = String(+(eW / total).toFixed(3))
         preview.style.flex = String(+(pW / total).toFixed(3))
       }
-      const onUp = () => {
+      const onUp = (): void => {
         splitter.classList.remove('active')
         document.body.style.cursor = ''
         document.body.style.userSelect = ''
@@ -980,49 +1012,49 @@ $btnLog.onclick = async () => {
   }
 }
 
-// ---------- 启动 ----------
-const IS_VIEW_MODE = location.pathname.startsWith('/view/')
-
-if (IS_VIEW_MODE) ; else {
-  window.addEventListener('hashchange', () => { refreshFiles(); openFile() })
-  applyTheme(themeMode)
-  // 先拿到文件列表再开文件:默认文件缺失时的回退依赖 filesCache 已就绪
-  ;(async () => { await refreshFiles(); openFile() })()
-  bindTreeEvents()
-}
-
 // ---------- 目录结构实时同步(别人的新建/移动/删除) ----------
-function bindTreeEvents() {
-  let timer = null
+function bindTreeEvents(): void {
+  let timer: ReturnType<typeof setTimeout> | null = null
   const es = new EventSource('/api/events')
   es.onmessage = (ev) => {
-    let msg
+    let msg: { type?: string }
     try { msg = JSON.parse(ev.data) } catch { return }
     if (msg.type !== 'tree') return
     // 合并短时间内的多次变更,避免拖拽批量移动时反复重建
-    clearTimeout(timer)
+    if (timer) clearTimeout(timer)
     timer = setTimeout(() => {
       refreshFiles()
       // 自己正打开的文件可能被移动/删除:静默跟随(openFile 内部会 resolve 并跳转)
-      resolvePath(currentFile()).then(r => { if (r.status !== 'ok') openFile() }).catch(() => {})
+      resolvePath(currentFile()).then(r => { if (r.status !== 'ok') openFile() }).catch(() => { /* 忽略 */ })
     }, 250)
   }
   // EventSource 自带重连;断网恢复后第一次 onopen 补一次全量刷新
-  es.onerror = () => {}
+  es.onerror = () => { /* 自动重连 */ }
   es.onopen = () => { if (filesCache.length) refreshFiles() }
+}
+
+// ---------- 启动 ----------
+const IS_VIEW_MODE = location.pathname.startsWith('/view/')
+
+if (!IS_VIEW_MODE) {
+  window.addEventListener('hashchange', () => { refreshFiles(); openFile() })
+  applyTheme(themeMode)
+  // 先拿到文件列表再开文件:默认文件缺失时的回退依赖 filesCache 已就绪
+  ;(async () => { await refreshFiles(); await openFile() })()
+  bindTreeEvents()
 }
 
 // 只读模式单独用 async IIFE(顶层 if 不能直接用 await)
 if (IS_VIEW_MODE) (async () => {
-  document.getElementById('sidebar').style.display = 'none'
-  document.getElementById('editor-col').style.display = 'none'
-  document.getElementById('splitter').style.display = 'none'
-  document.getElementById('btn-new').style.display = 'none'
-  document.getElementById('btn-save').style.display = 'none'
-  document.getElementById('btn-revision').style.display = 'none'
-  document.getElementById('btn-log').style.display = 'none'
-  document.getElementById('online').style.display = 'none'
-  const pv = document.getElementById('preview')
+  ;(document.getElementById('sidebar') as HTMLElement).style.display = 'none'
+  ;(document.getElementById('editor-col') as HTMLElement).style.display = 'none'
+  ;(document.getElementById('splitter') as HTMLElement).style.display = 'none'
+  ;(document.getElementById('btn-new') as HTMLElement).style.display = 'none'
+  ;(document.getElementById('btn-save') as HTMLElement).style.display = 'none'
+  ;(document.getElementById('btn-revision') as HTMLElement).style.display = 'none'
+  ;(document.getElementById('btn-log') as HTMLElement).style.display = 'none'
+  ;(document.getElementById('online') as HTMLElement).style.display = 'none'
+  const pv = document.getElementById('preview') as HTMLElement
   pv.style.display = ''
   pv.style.maxWidth = '52rem'
   pv.style.margin = '0 auto'
@@ -1036,23 +1068,23 @@ if (IS_VIEW_MODE) (async () => {
     const text = await (await fetch('/api/content?path=' + encodeURIComponent(file))).text()
     let md = text
     if (/^\[TOC\]$/m.test(md)) {
-      const tocLines = []
-      const walkToc = (toks) => toks.forEach(t => {
-        if (t.type === 'heading') tocLines.push('  '.repeat(Math.max(0, t.depth - 1)) + '- ' + t.text)
+      const tocLines: string[] = []
+      const walkToc = (toks: MdToken[]): void => toks.forEach(t => {
+        if (t.type === 'heading') tocLines.push('  '.repeat(Math.max(0, (t.depth || 1) - 1)) + '- ' + t.text)
         if (t.tokens) walkToc(t.tokens)
       })
-      walkToc(marked.lexer(md))
+      walkToc(marked.lexer(md) as MdToken[])
       md = md.replace(/^\[TOC\]$/gm, tocLines.join('\n'))
     }
-    pv.innerHTML = DOMPurify.sanitize(marked.parse(md, { gfm: true, breaks: true }))
+    pv.innerHTML = DOMPurify.sanitize(marked.parse(md, { gfm: true, breaks: true }) as string)
     highlightPreview()
-    pv.querySelectorAll('a[href^="http"]').forEach(a => { a.target = '_blank'; a.rel = 'noopener' })
+    pv.querySelectorAll<HTMLAnchorElement>('a[href^="http"]').forEach(a => { a.target = '_blank'; a.rel = 'noopener' })
     // 内链跳转到对应的只读视图
-    pv.querySelectorAll('a[href^="#"]').forEach(a => {
-      const href = a.getAttribute('href').slice(1)
+    pv.querySelectorAll<HTMLAnchorElement>('a[href^="#"]').forEach(a => {
+      const href = a.getAttribute('href')!.slice(1)
       if (href) a.href = '/view/' + href
     })
   } catch (e) {
-    pv.innerHTML = '<p style="color:#e0533d;text-align:center;margin-top:40vh">加载失败:' + e.message + '</p>'
+    pv.innerHTML = '<p style="color:#e0533d;text-align:center;margin-top:40vh">加载失败:' + (e instanceof Error ? e.message : String(e)) + '</p>'
   }
 })()
