@@ -299,6 +299,8 @@ const TOOLBAR = [
 // ---------- 笔记链接菜单(工具栏 🔗:笔记内链 + 外部 URL) ----------
 let filesCache = []
 let dirsCache = []   // 目录列表(移动目标选择器用)
+// 根目录的 .gitignore 是仓库配置:不可移动/改名/删除(子目录里的同名文件不受限)
+const isProtectedPath = (p) => p === '.gitignore'
 function openLinkMenu(anchorBtn) {
   const menu = openMenu(anchorBtn, {
     left: r => Math.max(8, r.left - 130),
@@ -413,11 +415,12 @@ let dragItems = []           // 本次拖拽的源(单选或框选)
 
 // 拖拽入口:写在 render 循环外,由各 row 触发
 function setupDrag(rowEl, path, isDir) {
+  if (isProtectedPath(path)) { rowEl.draggable = false; return }  // 受保护文件不可拖走
   rowEl.draggable = true
   rowEl.addEventListener('dragstart', (e) => {
     // 没有加入多选 → 拖的就是它自己
     if (!selection.has(path)) { selection.clear(); selection.add(path); renderSelection() }
-    dragItems = [...selection].map(p => ({
+    dragItems = [...selection].filter(p => !isProtectedPath(p)).map(p => ({
       from: p,
       isDir: !filesCache.includes(p), // 不在文件列表 → 目录
     }))
@@ -872,12 +875,20 @@ async function deleteItem(path, isDir) {
 }
 // 行操作菜单:移动 / 重命名 / 删除
 function openRowMenu(anchorBtn, path, isDir) {
+  const locked = isProtectedPath(path)   // 根目录 .gitignore:仓库配置,禁止移动/改名/删除
+  const guard = (fn) => () => { if (locked) { toast('根目录 .gitignore 是仓库配置,不能修改', 'err'); return } fn() }
   openMenu(anchorBtn, {
     left: r => Math.min(window.innerWidth - 200, Math.max(8, r.left - 150)),
     build: (menu) => {
-      menuItem(menu, { icon: 'right-left', label: '移动', onClick: () => moveItem(anchorBtn, path, isDir) })
-      menuItem(menu, { icon: 'pen-to-square', label: '重命名', onClick: () => renameItem(path, isDir) })
-      menuItem(menu, { icon: 'trash-can', label: '删除', danger: true, onClick: () => deleteItem(path, isDir) })
+      menuItem(menu, { icon: 'right-left', label: '移动', onClick: guard(() => moveItem(anchorBtn, path, isDir)) })
+      menuItem(menu, { icon: 'pen-to-square', label: '重命名', onClick: guard(() => renameItem(path, isDir)) })
+      menuItem(menu, { icon: 'trash-can', label: '删除', danger: true, onClick: guard(() => deleteItem(path, isDir)) })
+      if (locked) {
+        const note = document.createElement('div')
+        note.className = 'note-menu-empty'
+        note.textContent = '· 根目录 .gitignore 受保护 ·'
+        menu.appendChild(note)
+      }
     },
   })
 }

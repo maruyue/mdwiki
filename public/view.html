@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <title>mdwiki · 只读视图</title>
-<link rel="stylesheet" href="/code-theme.css?v=1795162051983">
+<link rel="stylesheet" href="/code-theme.css?v=1795163045499">
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -73,7 +73,7 @@
   <nav id="sidebar"></nav>
   <div id="content"><div id="empty">从左侧选择文件,或先在编辑端「📷 存版本」产生提交</div></div>
 </main>
-<script src="/vendor.js?v=1795162051983"></script>
+<script src="/vendor.js?v=1795163045499"></script>
 <script>
 // 只读视图:全部数据来自 /view-api(读 worktree 的 HEAD 快照,与编辑端物理隔离)
 const $sidebar = document.getElementById('sidebar')
@@ -171,7 +171,15 @@ async function loadFile() {
   if (!f) return
   try {
     const resp = await fetch('/view-api/content?path=' + encodeURIComponent(f))
-    if (!resp.ok) throw new Error('HEAD 快照中没有这个文件(可能未提交或已删除)')
+    if (!resp.ok) {
+      // 文件被移动/改名了 → 跟着旧路径找到新位置(已打开的书签/标签页不会失效)
+      const r = await fetch('/api/resolve?path=' + encodeURIComponent(f)).then(x => x.json()).catch(() => null)
+      if (r && r.status === 'moved') {
+        location.hash = '#' + encodeURIComponent(r.to)
+        return   // hashchange 会重新加载
+      }
+      throw new Error(r && r.status === 'gone' ? '文件已被删除' : 'HEAD 快照中没有这个文件(可能未提交)')
+    }
     const text = await resp.text()
     if (f.endsWith('.md')) {
       $content.innerHTML = DOMPurify.sanitize(marked.parse(text, { gfm: true, breaks: true }))

@@ -343,6 +343,7 @@ const server = http.createServer(async (req, res) => {
         const to = String(b.to || '').trim()
         if (!rawFrom) return json({ ok: false, error: '缺少源路径' }, 400)
         if (rawFrom === '/' || rawFrom === '.') return json({ ok: false, error: '根目录不能被移动' }, 400)
+        if (rawFrom === '.gitignore') return json({ ok: false, error: '根目录 .gitignore 是仓库配置,不能移动或重命名' }, 400)
         // 目录探测必须在 safePath 之前:safePath 会给无后缀名强加 .md,目录名会被改写
         const fromDir = safeDirPath(rawFrom)
         const dirSrc = fromDir ? notePath(fromDir) : null
@@ -403,6 +404,7 @@ const server = http.createServer(async (req, res) => {
         const results = []
         for (const it of items) {
           const rawFrom = String(it.from || '').trim()
+          if (rawFrom === '.gitignore') { results.push({ from: rawFrom, ok: false, error: '根目录 .gitignore 不能移动' }); continue }
           const fromDir = safeDirPath(rawFrom)
           const dirSrc = fromDir ? notePath(fromDir) : null
           const isDir = !!(it.isDir && dirSrc && fs.existsSync(dirSrc) && fs.statSync(dirSrc).isDirectory())
@@ -438,6 +440,8 @@ const server = http.createServer(async (req, res) => {
         const b = await readBody(req)
         const rel = safeDirPath(b.path)
         if (!rel) return json({ ok: false, error: '非法路径' }, 400)
+        // 根目录的 .gitignore 是仓库配置,禁止删除(子目录里的不管)
+        if (rel === '.gitignore') return json({ ok: false, error: '根目录 .gitignore 是仓库配置,不能删除' }, 400)
         const target = notePath(rel)
         if (!fs.existsSync(target)) return json({ ok: false, error: '不存在' }, 404)
         fs.rmSync(target, { recursive: true, force: true })
@@ -474,7 +478,9 @@ const server = http.createServer(async (req, res) => {
         if (r.status !== 0) return json({ ok: false, error: '没有变更可提交' })
         // 提交后立刻把只读视图的 worktree 跳到新 HEAD,并通知所有页面刷新
         refreshReadView('commit')
-        noteTreeChanged('commit')
+        // 提交后必须无条件广播:目录集合在移动时就变过了,这里结构指纹不会变,
+        // 走 noteTreeChanged 会被去重吞掉 → 只读视图不知道有新快照(2026-11-20 实测)
+        broadcastTree('commit')
         return json({ ok: true, commit: gitOut('rev-parse', '--short', 'HEAD'), message: msg, flushed })
       }
       if (url.pathname === '/api/log' && req.method === 'GET') {
