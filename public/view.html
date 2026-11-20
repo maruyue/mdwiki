@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<title>mdwiki · 只读视图</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    --bg: #1e1e1e; --bg2: #252526; --bg3: #2d2d2d;
+    --border: #333; --border2: #3e3e42;
+    --fg: #cccccc; --fg-strong: #e8e8e8; --fg-dim: #8a8a8a;
+    --accent: #7ec699; --link: #4daafc; --code-bg: #2b2b2b; --pre-bg: #1a1a1a;
+    --th-bg: #252526; --scroll: #424242;
+  }
+  body.light {
+    --bg: #ffffff; --bg2: #f8f8f8; --bg3: #e8e8e8;
+    --border: #e2e2e2; --border2: #dcdcdc;
+    --fg: #333333; --fg-strong: #1a1a1a; --fg-dim: #888888;
+    --accent: #0a7d47; --link: #0451a5; --code-bg: #f1f1f1; --pre-bg: #f8f8f8;
+    --th-bg: #f0f0f0; --scroll: #c1c1c1;
+  }
+  body { font-family: -apple-system, "PingFang SC", sans-serif; height: 100vh; display: flex; flex-direction: column; background: var(--bg); color: var(--fg); }
+  header { display: flex; align-items: center; gap: 10px; padding: 8px 14px; background: var(--bg2); border-bottom: 1px solid var(--border); }
+  header h1 { font-size: 14px; color: var(--accent); }
+  header .tag { font-size: 11px; color: var(--fg-dim); border: 1px solid var(--border2); border-radius: 8px; padding: 1px 8px; }
+  #status { font-size: 12px; color: var(--fg-dim); margin-left: auto; }
+  #btn-refresh { background: var(--bg3); color: var(--fg); border: 1px solid var(--border2); padding: 4px 12px; border-radius: 4px; cursor: pointer; font-size: 13px; }
+  #btn-refresh:hover { background: var(--bg3); filter: brightness(1.2); }
+  #btn-refresh:disabled { opacity: .5; cursor: wait; }
+  main { flex: 1; display: flex; overflow: hidden; }
+  #sidebar { width: 220px; background: var(--bg2); border-right: 1px solid var(--border); padding-top: 8px; overflow-y: auto; flex-shrink: 0; }
+  #sidebar a { display: flex; align-items: center; gap: 5px; padding: 6px 12px; color: var(--fg); text-decoration: none; font-size: 13px; }
+  #sidebar a:hover { background: var(--bg3); }
+  #sidebar a.active { background: var(--bg3); color: var(--fg-strong); border-left: 3px solid var(--accent); }
+  #sidebar a svg { width: 12px; height: 12px; flex-shrink: 0; color: var(--fg-dim); }
+  #content { flex: 1; overflow-y: auto; padding: 30px 44px; font-size: 15px; line-height: 1.75; color: var(--fg); max-width: 52rem; }
+  #content h1 { font-size: 1.75em; color: var(--fg-strong); margin: 1em 0 .5em; padding-bottom: .3em; border-bottom: 1px solid var(--border2); }
+  #content h2 { font-size: 1.4em; color: var(--fg-strong); margin: 1em 0 .5em; padding-bottom: .25em; border-bottom: 1px solid var(--border2); }
+  #content h3 { font-size: 1.18em; color: var(--fg-strong); margin: 1em 0 .4em; }
+  #content p { margin: .6em 0; }
+  #content a { color: var(--link); }
+  #content code { background: var(--code-bg); border-radius: 4px; padding: 2px 6px; font-size: .87em; font-family: "SF Mono", Menlo, Consolas, monospace; color: #ce9178; }
+  body.light #content code { color: #a31515; }
+  #content pre { background: var(--pre-bg); border: 1px solid var(--border); border-radius: 8px; padding: 13px 16px; overflow: auto; margin: .9em 0; }
+  #content pre code { background: none; padding: 0; color: var(--fg); }
+  #content blockquote { border-left: 4px solid var(--border2); padding: 6px 16px; margin: .8em 0; color: var(--fg-dim); }
+  #content table { border-collapse: collapse; margin: .9em 0; }
+  #content th, #content td { border: 1px solid var(--border2); padding: 6px 13px; }
+  #content th { background: var(--th-bg); }
+  #content img { max-width: 100%; }
+  #empty { color: var(--fg-dim); padding: 60px; text-align: center; }
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-thumb { background: var(--scroll); border-radius: 5px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+</style>
+</head>
+<body class="dark">
+<header>
+  <h1>mdwiki</h1><span class="tag">只读 · HEAD 快照</span>
+  <span id="status">加载中…</span>
+  <button id="btn-refresh">🔄 刷新快照</button>
+</header>
+<main>
+  <nav id="sidebar"></nav>
+  <div id="content"><div id="empty">从左侧选择文件,或先在编辑端「📷 存版本」产生提交</div></div>
+</main>
+<script src="https://cdn.jsdelivr.net/npm/marked@15.0.7/lib/marked.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/dompurify@3.2.6/dist/purify.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/highlight.js@11.11.1/lib/common.min.js"></script>
+<script>
+// 只读视图:全部数据来自 /view-api(读 worktree 的 HEAD 快照,与编辑端物理隔离)
+const $sidebar = document.getElementById('sidebar')
+const $content = document.getElementById('content')
+const $status = document.getElementById('status')
+const $btn = document.getElementById('btn-refresh')
+const fileIcon = '<svg viewBox="0 0 384 512" fill="currentColor"><path d="M0 64C0 28.7 28.7 0 64 0H224V128c0 17.7 14.3 32 32 32H384V448c0 35.3-28.7 64-64 64H64c-35.3 0-64-28.7-64-64V64zm384 64H256V0L384 128z"/></svg>'
+const current = () => decodeURIComponent(location.hash.slice(1))
+
+async function loadStatus() {
+  try {
+    const s = (await (await fetch('/view-api/status')).json())
+    if (s.ok === true) $status.textContent = `HEAD ${s.head} · 同步于 ${new Date(s.syncedAt).toLocaleTimeString('zh-CN')}${s.trigger ? ' (' + s.trigger + ')' : ''}`
+    else if (s.ok === false) $status.textContent = '同步失败: ' + (s.error || '')
+    else $status.textContent = '尚未同步'
+  } catch { $status.textContent = '服务不可达' }
+}
+
+async function loadTree() {
+  try {
+    const r = (await (await fetch('/view-api/files')).json())
+    $sidebar.innerHTML = ''
+    for (const f of r.files || []) {
+      const a = document.createElement('a')
+      a.href = '#' + encodeURIComponent(f)
+      a.innerHTML = fileIcon + '<span>' + f.split('/').pop() + '</span>'
+      a.title = f
+      if (f === current()) a.classList.add('active')
+      $sidebar.appendChild(a)
+    }
+    if (!($sidebar.children.length)) $sidebar.innerHTML = '<div style="padding:12px;color:var(--fg-dim);font-size:12px">(无已提交文件)</div>'
+  } catch (e) { $sidebar.innerHTML = '<div style="padding:12px;color:#e0533d;font-size:12px">加载失败</div>' }
+}
+
+async function loadFile() {
+  const f = current()
+  if (!f) return
+  try {
+    const text = await (await fetch('/view-api/content?path=' + encodeURIComponent(f))).text()
+    if (f.endsWith('.md')) {
+      $content.innerHTML = DOMPurify.sanitize(marked.parse(text, { gfm: true, breaks: true }))
+      $content.querySelectorAll('pre code').forEach(el => { try { hljs.highlightElement(el) } catch {} })
+    } else {
+      const esc = text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      const lang = (f.match(/\.([a-z0-9]+)$/i)?.[1] || '').replace('yml', 'yaml')
+      $content.innerHTML = `<pre><code class="language-${lang}">${esc}</code></pre>`
+      try { hljs.highlightElement($content.querySelector('code')) } catch {}
+    }
+    document.title = f.split('/').pop() + ' · mdwiki 只读'
+  } catch (e) {
+    $content.innerHTML = '<div id="empty">读取失败: ' + f + '</div>'
+  }
+}
+
+function refreshAll() { loadTree(); loadFile(); loadStatus() }
+
+$btn.onclick = async () => {
+  $btn.disabled = true; $btn.textContent = '⏳ 同步中…'
+  try { await fetch('/view-api/refresh', { method: 'POST' }) } catch {}
+  refreshAll()
+  $btn.disabled = false; $btn.textContent = '🔄 刷新快照'
+}
+
+window.addEventListener('hashchange', () => { loadTree(); loadFile() })
+// 60 秒自动对表(与服务器端定时同步同节奏;本地只重取数据,同步动作在服务端)
+setInterval(refreshAll, 60 * 1000)
+
+refreshAll()
+</script>
+</body>
+</html>

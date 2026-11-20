@@ -70,6 +70,37 @@ const gitRun = (...args) => spawnSync('git', ['-c', 'core.quotepath=false', '-C'
 const gitOut = (...args) => gitRun(...args).stdout.trim()
 const inodeKeyOf = (p) => { const st = fs.statSync(p); return `${st.dev}-${st.ino}` }
 
+// ---------- 只读视图(git worktree --detach):永远展示 HEAD 快照 ----------
+// 编辑端(内存房间/工作区)与只读端物理隔离:同步只动 ../read-view,不碰 notes/
+const VIEW_DIR = path.join(__dirname, '..', 'read-view')
+let viewSyncing = false
+let viewStatus = { ok: null, head: '', syncedAt: null, error: null }
+function refreshReadView(trigger) {
+  if (viewSyncing) return viewStatus
+  viewSyncing = true
+  try {
+    if (!fs.existsSync(VIEW_DIR)) {
+      // 首次:建游离 worktree(检出 main 当前快照,零分支)
+      fs.mkdirSync(path.dirname(VIEW_DIR), { recursive: true })
+      const r = gitRun('-C', NOTES, 'worktree', 'add', '--detach', VIEW_DIR, 'main')
+      if (r.status !== 0) throw new Error('worktree add 失败: ' + (r.stderr || '').trim().slice(0, 120))
+    } else {
+      // 后续:游离 HEAD 增量跳到最新 main(只重写变化文件)
+      const r = gitRun('-C', VIEW_DIR, 'reset', '--hard', 'main')
+      if (r.status !== 0) throw new Error('reset 失败: ' + (r.stderr || '').trim().slice(0, 120))
+    }
+    // 游离 worktree 与主仓共享对象库,reset 后 main 引用对它可见;无需 fetch
+    viewStatus = { ok: true, head: gitOut('-C', VIEW_DIR, 'rev-parse', '--short', 'HEAD'), syncedAt: new Date().toISOString(), trigger }
+  } catch (e) {
+    viewStatus = { ok: false, head: viewStatus.head, syncedAt: viewStatus.syncedAt, error: e.message, trigger }
+    console.log('[view-sync] ' + e.message)
+  }
+  viewSyncing = false
+  return viewStatus
+}
+// 60 秒自动同步
+setInterval(() => refreshReadView('auto'), 60 * 1000)
+
 // ---------- 房间:按 inode 键控 ----------
 const rooms = new Map()      // inodeKey -> { doc, dirty, flushed }
 const registry = new Map()   // inodeKey -> 当前路径(移动时一条赋值,房间不动)
@@ -364,6 +395,42 @@ const server = http.createServer(async (req, res) => {
         room.dirty = true
         return json({ ok: true, chars: content.length })
       }
+      // ---- 只读视图路由(/view 与 /view-api/*) ----
+      if (url.pathname === '/view') {
+        const f = path.join(__dirname, 'public', 'view.html')
+        return [200, { 'Content-Type': 'text/html; charset=utf-8' }, fs.readFileSync(f)]
+      }
+      if (url.pathname === '/view-api/status' && req.method === 'GET') {
+        return json({ ok: true, ...viewStatus })
+      }
+      if (url.pathname === '/view-api/refresh' && req.method === 'POST') {
+        const st = refreshReadView('manual')
+        return json({ ok: st.ok !== false, ...st })
+      }
+      if (url.pathname === '/view-api/files' && req.method === 'GET') {
+        // 从 worktree 递归列出白名单文件(不读内存、不读 notes/ 工作区)
+        const list = (dir = VIEW_DIR, prefix = '') => {
+          const out = []
+          for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+            if (e.name === '.git' || e.name === '.gitkeep') continue   // .git 是文件(worktree 指针),也要跳
+            const rel = prefix ? `${prefix}/${e.name}` : e.name
+            const abs = path.join(dir, e.name)
+            if (e.isDirectory()) out.push(...list(abs, rel))
+            else if (e.name.startsWith('.') || EXTS.some(x => e.name.toLowerCase().endsWith(x))) out.push(rel)
+          }
+          return out
+        }
+        return json({ ok: true, files: list().sort(), status: viewStatus })
+      }
+      if (url.pathname === '/view-api/content' && req.method === 'GET') {
+        // 只取白名单内路径,防止路径穿越读到 worktree 之外
+        const rel = safePath(url.searchParams.get('path') || '')
+        const abs = rel ? path.join(VIEW_DIR, rel) : null
+        if (!abs || !abs.startsWith(VIEW_DIR + path.sep) || !fs.existsSync(abs) || !fs.statSync(abs).isFile()) {
+          return json({ ok: false, error: '不存在' }, 404)
+        }
+        return [200, { 'Content-Type': 'text/plain; charset=utf-8' }, fs.readFileSync(abs, 'utf8')]
+      }
       // 静态文件
       const rel = url.pathname === '/' ? '/index.html' : url.pathname
       const f = path.join(__dirname, 'public', rel)
@@ -405,4 +472,5 @@ server.on('upgrade', (req, socket, head) => {
   })
 })
 
-server.listen(PORT, () => console.log(`mdwiki-demo(inode 身份架构) 启动: http://localhost:${PORT}  笔记目录: ${NOTES}`))
+refreshReadView('startup')
+server.listen(PORT, () => console.log(`mdwiki-demo(inode 身份架构) 启动: http://localhost:${PORT}  笔记目录: ${NOTES}  只读视图: /view`))

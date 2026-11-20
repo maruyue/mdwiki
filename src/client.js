@@ -225,6 +225,7 @@ const insertAtCursor = (text) => {
   view.focus()
 }
 const insertCodeBlock = () => insertAtCursor('\n```\n\n```\n')
+const insertTable = () => insertAtCursor('\n| 列1 | 列2 | 列3 |\n|---|---|---|\n| 内容 | 内容 | 内容 |\n')
 
 // ---------- Font Awesome 图标(内联 SVG,currentColor 随主题) ----------
 const ICONS = {
@@ -272,10 +273,10 @@ const TOOLBAR = [
   { sep: 1 },
   { icon: 'list-ul', title: '无序列表', act: () => linePrefix('- ') },
   { icon: 'list-ol', title: '有序列表', act: () => linePrefix('1. ') },
-  { icon: 'check-square', title: '任务列表', act: () => linePrefix('- [ ] ') },
   { sep: 1 },
   { icon: 'link', title: '插入链接(笔记 / 外部 URL)', act: function () { openLinkMenu(this) } },
   { icon: 'minus', title: '分隔线', act: () => insertAtCursor('\n\n---\n\n') },
+  { icon: 'table', title: '表格', act: insertTable },
   { sep: 1 },
   { icon: 'wand-magic-sparkles', title: '格式化(json/yaml)', act: formatDoc, fmt: true },
 ]
